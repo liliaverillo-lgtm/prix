@@ -1,0 +1,16 @@
+# Cache données ENTSO-E (re-téléchargées automatiquement)
+.cache_prix/
+
+# Token API — NE JAMAIS committer ce fichier
+.streamlit/secrets.toml
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.env
+venv/
+.venv/
+
+# OS
+.DS_Store

@@ -1,0 +1,17 @@
+# Dashboard Prix Day-Ahead ENTSO-E
+# Généré le 01/07/2026
+
+# Interface web
+streamlit>=1.58.0
+
+# Données ENTSO-E
+entsoe-py>=0.8.0
+
+# Visualisation
+plotly>=5.24.0
+
+# Données
+pandas>=2.2.0
+
+# Cache parquet
+pyarrow>=17.0.0
