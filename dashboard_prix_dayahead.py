@@ -216,7 +216,7 @@ if not donnees:
 # ── Graphique principal ────────────────────────────────────────────────────────
 fig = go.Figure()
 
-for i, (pays, sr) in enumerate(donnees.items()):
+for pays, sr in donnees.items():
     idx = list(PAYS.keys()).index(pays)
     couleur = PALETTE[idx % len(PALETTE)]
     fig.add_trace(go.Scatter(
@@ -225,43 +225,16 @@ for i, (pays, sr) in enumerate(donnees.items()):
         name=pays,
         line=dict(color=couleur, width=1.8),
         mode="lines",
-        hovertemplate=f"<b>{pays}</b><br>%{{x|%d/%m/%Y %H:%M}}<br><b>%{{y:.1f}} €/MWh</b><extra></extra>",
     ))
 
+# Layout minimal — compatible toutes versions Plotly / Python 3.14
 fig.update_layout(
     height=520,
-    margin=dict(l=0, r=0, t=30, b=0),
-    paper_bgcolor="rgba(0,0,0,0)",
-    plot_bgcolor="#111827",
-    legend=dict(
-        orientation="v",
-        yanchor="top", y=1,
-        xanchor="left", x=1.01,
-        bgcolor="rgba(17,24,39,0.8)",
-        bordercolor="#374151",
-        borderwidth=1,
-        font=dict(color="#D1D5DB", size=12),
-    ),
-    xaxis=dict(
-        gridcolor="#1F2937",
-        linecolor="#374151",
-        tickcolor="#6B7280",
-        tickfont=dict(color="#9CA3AF"),
-        rangeslider=dict(visible=True, thickness=0.05),
-    ),
-    yaxis=dict(
-        title="€/MWh",
-        titlefont=dict(color="#9CA3AF"),
-        gridcolor="#1F2937",
-        linecolor="#374151",
-        tickcolor="#6B7280",
-        tickfont=dict(color="#9CA3AF"),
-        zeroline=True,
-        zerolinecolor="#EF4444",
-        zerolinewidth=1,
-    ),
     hovermode="x unified",
+    margin=dict(l=10, r=10, t=30, b=10),
 )
+fig.update_xaxes(rangeslider_visible=True)
+fig.update_yaxes(title_text="€/MWh")
 
 st.plotly_chart(fig, use_container_width=True)
 
