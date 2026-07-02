@@ -16,11 +16,14 @@ Lancer :
 """
 
 import os
+import io
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, timedelta
 
 import pandas as pd
 import plotly.graph_objects as go
+import boto3
+from botocore.exceptions import ClientError
 import streamlit as st
 
 # ── Config page ────────────────────────────────────────────────────────────────
@@ -31,10 +34,22 @@ st.set_page_config(
 )
 
 # ── Constantes ─────────────────────────────────────────────────────────────────
-CACHE_DIR  = ".cache_prix"
-MASTER_DB  = os.path.join(CACHE_DIR, "master_db.parquet")
+# ── Stockage R2 ───────────────────────────────────────────────────────────────
+R2_KEY   = "prix_dayahead/master_db.parquet"   # chemin dans le bucket R2
+LOCAL_TMP = "/tmp/master_db_prix.parquet"       # cache local de session (Streamlit Cloud)
 
-os.makedirs(CACHE_DIR, exist_ok=True)
+def get_r2():
+    """Retourne un client boto3 configuré pour Cloudflare R2."""
+    return boto3.client(
+        "s3",
+        endpoint_url       = st.secrets["R2_ENDPOINT"],
+        aws_access_key_id  = st.secrets["R2_ACCESS_KEY"],
+        aws_secret_access_key = st.secrets["R2_SECRET_KEY"],
+        region_name        = "auto",
+    )
+
+def r2_bucket() -> str:
+    return st.secrets["R2_BUCKET"]
 
 # Pays disponibles : code ENTSO-E → nom affiché
 PAYS = {
@@ -69,18 +84,40 @@ PALETTE = [
 # ══════════════════════════════════════════════════════════════════════════════
 
 def load_db() -> pd.DataFrame:
-    """Charge le master_db.parquet. Retourne un DataFrame vide si absent."""
-    if os.path.exists(MASTER_DB):
-        df = pd.read_parquet(MASTER_DB)
+    """
+    Charge master_db depuis R2.
+    Utilise /tmp/ comme cache de session pour éviter de re-télécharger
+    à chaque rerun Streamlit.
+    """
+    # Cache local déjà présent dans cette session → lecture directe
+    if os.path.exists(LOCAL_TMP):
+        df = pd.read_parquet(LOCAL_TMP)
         if df.index.tz is None:
             df.index = df.index.tz_localize("UTC")
         return df
-    return pd.DataFrame()
+    # Téléchargement depuis R2
+    try:
+        s3 = get_r2()
+        s3.download_file(r2_bucket(), R2_KEY, LOCAL_TMP)
+        df = pd.read_parquet(LOCAL_TMP)
+        if df.index.tz is None:
+            df.index = df.index.tz_localize("UTC")
+        return df
+    except ClientError as e:
+        if e.response["Error"]["Code"] in ("404", "NoSuchKey"):
+            return pd.DataFrame()   # base encore vide
+        raise
 
 
 def save_db(df: pd.DataFrame):
-    """Sauvegarde le DataFrame dans master_db.parquet."""
-    df.to_parquet(MASTER_DB)
+    """
+    Sauvegarde le DataFrame :
+      1. En local dans /tmp/ (mise à jour du cache session)
+      2. Upload vers R2
+    """
+    df.to_parquet(LOCAL_TMP)
+    s3 = get_r2()
+    s3.upload_file(LOCAL_TMP, r2_bucket(), R2_KEY)
 
 
 def merge_into_db(new_df: pd.DataFrame) -> pd.DataFrame:
