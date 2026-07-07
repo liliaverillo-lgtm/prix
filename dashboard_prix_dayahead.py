@@ -2,29 +2,34 @@
 dashboard_prix_dayahead.py
 ───────────────────────────
 Dashboard Streamlit — Prix Day-Ahead ENTSO-E
+Même architecture que le dashboard nucléaire :
+  • Données persistées sur Cloudflare R2 (master_db.parquet)
+  • Au démarrage : chargement depuis R2 vers /tmp/
+  • Données manquantes pour la sélection → auto-fetch ENTSO-E → sauvegarde R2
+  • Upload fichier Parquet → fusion dans R2
 
-Fonctionnement :
-  • Une base de données locale (master_db.parquet) accumule toutes les données.
-  • Deux façons d'alimenter la base :
-      1. Upload d'un fichier Parquet (ex. produit par le script de téléchargement)
-      2. Téléchargement via l'API ENTSO-E pour les pays/périodes manquants
-  • Le dashboard lit toujours depuis la base locale → rapide après le premier chargement.
+Secrets requis (.streamlit/secrets.toml) :
+    ENTSOE_TOKEN = "..."
+    [r2]
+    account_id        = "..."
+    access_key_id     = "..."
+    secret_access_key = "..."
+    bucket_name       = "..."
 
 Lancer :
-    pip install streamlit entsoe-py plotly pandas pyarrow requests
+    pip install streamlit entsoe-py plotly pandas pyarrow boto3
     streamlit run dashboard_prix_dayahead.py
 """
 
 import os
-import io
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, timedelta
 
+import boto3
 import pandas as pd
 import plotly.graph_objects as go
-import boto3
-from botocore.exceptions import ClientError
 import streamlit as st
+from botocore.exceptions import ClientError
 
 # ── Config page ────────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -34,24 +39,9 @@ st.set_page_config(
 )
 
 # ── Constantes ─────────────────────────────────────────────────────────────────
-# ── Stockage R2 ───────────────────────────────────────────────────────────────
-R2_KEY   = "prix_dayahead/master_db.parquet"   # chemin dans le bucket R2
-LOCAL_TMP = "/tmp/master_db_prix.parquet"       # cache local de session (Streamlit Cloud)
+R2_KEY   = "prix_dayahead/master_db.parquet"
+LOCAL_TMP = "/tmp/master_db_prix.parquet"
 
-def get_r2():
-    """Retourne un client boto3 configuré pour Cloudflare R2."""
-    return boto3.client(
-        "s3",
-        endpoint_url       = st.secrets["R2_ENDPOINT"],
-        aws_access_key_id  = st.secrets["R2_ACCESS_KEY"],
-        aws_secret_access_key = st.secrets["R2_SECRET_KEY"],
-        region_name        = "auto",
-    )
-
-def r2_bucket() -> str:
-    return st.secrets["R2_BUCKET"]
-
-# Pays disponibles : code ENTSO-E → nom affiché
 PAYS = {
     "FR":      "France",
     "DE_LU":   "Allemagne",
@@ -69,8 +59,7 @@ PAYS = {
     "DK_1":    "Danemark (DK1)",
     "FI":      "Finlande",
 }
-CODE_TO_NOM = PAYS                        # code  → nom
-NOM_TO_CODE = {v: k for k, v in PAYS.items()}  # nom → code
+NOM_TO_CODE = {v: k for k, v in PAYS.items()}
 
 PALETTE = [
     "#4C9BE8", "#E24444", "#2DB87A", "#F5A623", "#A855F7",
@@ -80,24 +69,41 @@ PALETTE = [
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  BASE DE DONNÉES LOCALE
+#  CLIENT R2
+# ══════════════════════════════════════════════════════════════════════════════
+
+@st.cache_resource
+def get_r2_client():
+    """Client boto3 pour Cloudflare R2 — partagé entre les sessions."""
+    r2 = st.secrets["r2"]
+    return boto3.client(
+        "s3",
+        endpoint_url          = f"https://{r2['account_id']}.r2.cloudflarestorage.com",
+        aws_access_key_id     = r2["access_key_id"],
+        aws_secret_access_key = r2["secret_access_key"],
+        region_name           = "auto",
+    )
+
+def r2_bucket() -> str:
+    return st.secrets["r2"]["bucket_name"]
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  BASE DE DONNÉES (R2 ↔ /tmp/)
 # ══════════════════════════════════════════════════════════════════════════════
 
 def load_db() -> pd.DataFrame:
     """
-    Charge master_db depuis R2.
-    Utilise /tmp/ comme cache de session pour éviter de re-télécharger
-    à chaque rerun Streamlit.
+    Charge la base depuis R2.
+    Cache dans /tmp/ pour éviter de re-télécharger à chaque rerun.
     """
-    # Cache local déjà présent dans cette session → lecture directe
     if os.path.exists(LOCAL_TMP):
         df = pd.read_parquet(LOCAL_TMP)
         if df.index.tz is None:
             df.index = df.index.tz_localize("UTC")
         return df
-    # Téléchargement depuis R2
     try:
-        s3 = get_r2()
+        s3 = get_r2_client()
         s3.download_file(r2_bucket(), R2_KEY, LOCAL_TMP)
         df = pd.read_parquet(LOCAL_TMP)
         if df.index.tz is None:
@@ -105,110 +111,111 @@ def load_db() -> pd.DataFrame:
         return df
     except ClientError as e:
         if e.response["Error"]["Code"] in ("404", "NoSuchKey"):
-            return pd.DataFrame()   # base encore vide
+            return pd.DataFrame()
         raise
 
 
 def save_db(df: pd.DataFrame):
-    """
-    Sauvegarde le DataFrame :
-      1. En local dans /tmp/ (mise à jour du cache session)
-      2. Upload vers R2
-    """
+    """Sauvegarde /tmp/ + upload vers R2."""
     df.to_parquet(LOCAL_TMP)
-    s3 = get_r2()
+    s3 = get_r2_client()
     s3.upload_file(LOCAL_TMP, r2_bucket(), R2_KEY)
 
 
 def merge_into_db(new_df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Fusionne new_df dans la base locale.
-    - Les nouvelles dates/pays sont ajoutés.
-    - Les données existantes sont mises à jour si new_df a des valeurs.
-    Retourne le DataFrame fusionné.
-    """
-    # S'assurer que l'index est bien en UTC
+    """Fusionne new_df dans la base R2. new_df est prioritaire."""
     if new_df.index.tz is None:
         new_df.index = new_df.index.tz_localize("UTC")
     else:
         new_df.index = new_df.index.tz_convert("UTC")
-
     existing = load_db()
-    if existing.empty:
-        merged = new_df.copy()
-    else:
-        # combine_first : new_df prioritaire, existing comble les trous
-        merged = new_df.combine_first(existing)
-
+    merged = new_df.combine_first(existing) if not existing.empty else new_df.copy()
     save_db(merged)
     return merged
 
 
 def db_info(df: pd.DataFrame) -> str:
-    """Résumé lisible de la base."""
     if df.empty:
         return "Base vide"
-    start = df.index.min().strftime("%d/%m/%Y")
-    end   = df.index.max().strftime("%d/%m/%Y")
-    cols  = df.shape[1]
-    rows  = df.shape[0]
-    return f"{cols} pays · {rows:,} lignes · {start} → {end}"
+    return (f"{df.shape[1]} pays · {df.shape[0]:,} lignes · "
+            f"{df.index.min().strftime('%d/%m/%Y')} → "
+            f"{df.index.max().strftime('%d/%m/%Y')}")
+
+
+def pays_manquants_pour_periode(db: pd.DataFrame,
+                                 pays_list: list,
+                                 start: date,
+                                 end: date) -> list:
+    """
+    Retourne les pays dont les données sont absentes ou incomplètes
+    sur la période demandée.
+    """
+    manquants = []
+    ts_start = pd.Timestamp(start.isoformat(), tz="UTC")
+    ts_end   = pd.Timestamp(end.isoformat(),   tz="UTC") + pd.Timedelta(days=1)
+
+    for pays in pays_list:
+        if pays not in db.columns:
+            manquants.append(pays)
+            continue
+        # Vérifier si la période est couverte
+        sr = db.loc[ts_start:ts_end, pays].dropna()
+        heures_attendues = int((ts_end - ts_start).total_seconds() / 3600) - 1
+        if len(sr) < heures_attendues * 0.9:   # tolérance 10% (jours DST etc.)
+            manquants.append(pays)
+
+    return manquants
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  FETCH API ENTSO-E
 # ══════════════════════════════════════════════════════════════════════════════
 
-def get_api_key() -> str:
-    return st.secrets.get("ENTSOE_TOKEN", os.environ.get("ENTSOE_TOKEN", ""))
+@st.cache_resource
+def get_entsoe_client():
+    from entsoe import EntsoePandasClient
+    return EntsoePandasClient(api_key=st.secrets["ENTSOE_TOKEN"])
 
 
-def fetch_one_api(code: str, start: date, end: date) -> pd.Series | None:
-    """Télécharge les prix pour un pays depuis l'API ENTSO-E."""
-    api_key = get_api_key()
-    if not api_key:
-        return None
-    try:
-        from entsoe import EntsoePandasClient
-        from entsoe.exceptions import NoMatchingDataError
-        client   = EntsoePandasClient(api_key=api_key)
-        ts_start = pd.Timestamp(start.isoformat(), tz="Europe/Paris")
-        ts_end   = pd.Timestamp(end.isoformat(),   tz="Europe/Paris") + pd.Timedelta(days=1)
-        sr = client.query_day_ahead_prices(code, start=ts_start, end=ts_end)
-        return sr if (sr is not None and len(sr) > 0) else None
-    except Exception:
-        return None
-
-
-def fetch_pays_api(pays_list: list[str], start: date, end: date) -> dict:
+def fetch_pays(pays_list: list, start: date, end: date) -> int:
     """
-    Télécharge plusieurs pays en parallèle via l'API.
-    Retourne {nom_pays: Series}.
-    Ajoute automatiquement les données dans la base locale.
+    Télécharge les pays manquants en parallèle depuis ENTSO-E
+    et les fusionne dans R2.
+    Retourne le nombre de pays récupérés avec succès.
     """
+    from entsoe.exceptions import NoMatchingDataError
+
+    ts_start = pd.Timestamp(start.isoformat(), tz="Europe/Paris")
+    ts_end   = pd.Timestamp(end.isoformat(),   tz="Europe/Paris") + pd.Timedelta(days=1)
+
     results = {}
 
-    def _fetch(nom):
+    def _fetch_one(nom):
         code = NOM_TO_CODE.get(nom)
         if not code:
             return nom, None
-        sr = fetch_one_api(code, start, end)
-        return nom, sr
+        try:
+            client = get_entsoe_client()
+            sr = client.query_day_ahead_prices(code, start=ts_start, end=ts_end)
+            return nom, sr if (sr is not None and len(sr) > 0) else (nom, None)
+        except NoMatchingDataError:
+            return nom, None
+        except Exception:
+            return nom, None
 
     with ThreadPoolExecutor(max_workers=min(len(pays_list), 8)) as ex:
-        futures = {ex.submit(_fetch, nom): nom for nom in pays_list}
+        futures = {ex.submit(_fetch_one, nom): nom for nom in pays_list}
         for future in as_completed(futures):
             nom, sr = future.result()
             if sr is not None:
                 results[nom] = sr
 
-    # Fusionner dans la base
     if results:
         df_new = pd.DataFrame(results)
         df_new.index = pd.to_datetime(df_new.index, utc=True)
         merge_into_db(df_new)
 
-    return results
+    return len(results)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -216,10 +223,10 @@ def fetch_pays_api(pays_list: list[str], start: date, end: date) -> dict:
 # ══════════════════════════════════════════════════════════════════════════════
 
 def resample(df: pd.DataFrame, freq: str) -> pd.DataFrame:
-    if freq == "Horaire":   return df
-    if freq == "Journalier":  return df.resample("1D").mean()
+    if freq == "Horaire":      return df
+    if freq == "Journalier":   return df.resample("1D").mean()
     if freq == "Hebdomadaire": return df.resample("1W").mean()
-    if freq == "Mensuel":   return df.resample("1ME").mean()
+    if freq == "Mensuel":      return df.resample("1ME").mean()
     return df
 
 
@@ -231,24 +238,25 @@ with st.sidebar:
     st.markdown("## ⚡ Prix Day-Ahead")
     st.markdown("---")
 
-    # ── Uploader ───────────────────────────────────────────────────────────────
+    # ── Upload ─────────────────────────────────────────────────────────────────
     st.markdown("### 📂 Importer des données")
     uploaded = st.file_uploader(
         "Fichier Parquet (index datetime, colonnes = pays)",
         type=["parquet"],
-        help="Le fichier produit par le script de téléchargement est directement compatible.",
+        help="Produit par le script de téléchargement — directement compatible.",
     )
     if uploaded is not None:
         try:
             df_up = pd.read_parquet(uploaded)
-            # Normaliser l'index
             df_up.index = pd.to_datetime(df_up.index, utc=True)
             df_up.index.name = "timestamp"
+            # Invalider le cache /tmp/ pour forcer le rechargement
+            if os.path.exists(LOCAL_TMP):
+                os.remove(LOCAL_TMP)
             merged = merge_into_db(df_up)
             st.success(
-                f"✓ Données importées : {df_up.shape[1]} pays, "
-                f"{df_up.shape[0]:,} lignes\n\n"
-                f"Base mise à jour : {db_info(merged)}"
+                f"✓ {df_up.shape[1]} pays importés · {df_up.shape[0]:,} lignes\n\n"
+                f"R2 mis à jour : {db_info(merged)}"
             )
         except Exception as e:
             st.error(f"Erreur lors de l'import : {e}")
@@ -256,7 +264,7 @@ with st.sidebar:
     st.markdown("---")
 
     # ── Dates ──────────────────────────────────────────────────────────────────
-    st.markdown("### 📅 Période affichée")
+    st.markdown("### 📅 Période")
     col1, col2 = st.columns(2)
     with col1:
         date_debut = st.date_input(
@@ -291,25 +299,22 @@ with st.sidebar:
 
     col_a, col_b = st.columns(2)
     with col_a:
-        tout_cocher   = st.button("Tout cocher",   use_container_width=True)
+        if st.button("Tout cocher", use_container_width=True):
+            st.session_state.selection = {p: True for p in PAYS.values()}
     with col_b:
-        tout_decocher = st.button("Tout décocher", use_container_width=True)
+        if st.button("Tout décocher", use_container_width=True):
+            st.session_state.selection = {p: False for p in PAYS.values()}
 
     if "selection" not in st.session_state:
         st.session_state.selection = {p: p in ["France", "Allemagne"] for p in PAYS.values()}
-    if tout_cocher:
-        st.session_state.selection = {p: True for p in PAYS.values()}
-    if tout_decocher:
-        st.session_state.selection = {p: False for p in PAYS.values()}
 
-    # Charger la base pour savoir quels pays sont déjà disponibles
     db = load_db()
     pays_en_base = set(db.columns.tolist()) if not db.empty else set()
 
-    for i, nom in enumerate(PAYS.values()):
-        en_base = "✓" if nom in pays_en_base else "○"
+    for nom in PAYS.values():
+        badge = "✓" if nom in pays_en_base else "○"
         checked = st.checkbox(
-            f"{en_base} {nom}",
+            f"{badge} {nom}",
             value=st.session_state.selection.get(nom, False),
             key=f"cb_{nom}",
         )
@@ -318,24 +323,23 @@ with st.sidebar:
     pays_selectionnes = [p for p, v in st.session_state.selection.items() if v]
 
     st.markdown("---")
-    st.caption("✓ = données en base  ·  ○ = à télécharger via API")
+    st.caption(f"✓ = en base R2  ·  ○ = à télécharger\n\n{db_info(db)}")
 
-    # ── API fetch pour pays manquants ──────────────────────────────────────────
-    pays_manquants = [p for p in pays_selectionnes if p not in pays_en_base]
-    if pays_manquants and get_api_key():
-        st.markdown("### 🔄 Données manquantes")
-        st.warning(f"{len(pays_manquants)} pays pas encore en base :\n" +
-                   ", ".join(pays_manquants))
-        if st.button("Télécharger via API", use_container_width=True):
-            with st.spinner("Téléchargement en cours…"):
-                fetch_pays_api(pays_manquants, date_debut, date_fin)
-                db = load_db()
-            st.success("✓ Base mise à jour")
-            st.rerun()
-    elif pays_manquants and not get_api_key():
-        st.info("Importe un fichier Parquet pour ces pays ou ajoute ton token ENTSO-E dans les secrets.")
 
-    st.caption(f"Source : ENTSO-E  ·  Base : {db_info(db)}")
+# ══════════════════════════════════════════════════════════════════════════════
+#  AUTO-FETCH des données manquantes
+# ══════════════════════════════════════════════════════════════════════════════
+
+if pays_selectionnes:
+    manquants = pays_manquants_pour_periode(db, pays_selectionnes, date_debut, date_fin)
+    if manquants:
+        with st.spinner(f"Téléchargement depuis ENTSO-E : {', '.join(manquants)}…"):
+            n = fetch_pays(manquants, date_debut, date_fin)
+            db = load_db()
+        if n > 0:
+            st.success(f"✓ {n} pays téléchargés et sauvegardés dans R2.")
+        else:
+            st.warning("Données non disponibles sur ENTSO-E pour cette sélection.")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -349,7 +353,7 @@ st.markdown(
 st.markdown(
     f"<p style='color:#888;margin-top:4px'>"
     f"{date_debut.strftime('%d/%m/%Y')} → {date_fin.strftime('%d/%m/%Y')} "
-    f"· {resolution} · {len(pays_selectionnes)} pays sélectionné(s)</p>",
+    f"· {resolution} · {len(pays_selectionnes)} pays</p>",
     unsafe_allow_html=True,
 )
 
@@ -357,38 +361,33 @@ if not pays_selectionnes:
     st.info("Sélectionne au moins un pays dans le panneau gauche.")
     st.stop()
 
-# ── Préparer les données depuis la base ────────────────────────────────────────
 if db.empty:
-    st.warning("Base de données vide. Importe un fichier Parquet ou télécharge via l'API.")
+    st.warning("Base R2 vide. Les données vont être téléchargées automatiquement.")
     st.stop()
 
-# Filtrer par pays sélectionnés et disponibles
-pays_dispo = [p for p in pays_selectionnes if p in db.columns]
+# ── Filtrer par pays disponibles et période ────────────────────────────────────
+pays_dispo   = [p for p in pays_selectionnes if p in db.columns]
 pays_absents = [p for p in pays_selectionnes if p not in db.columns]
 
 if pays_absents:
     st.warning(f"Données non disponibles pour : {', '.join(pays_absents)}")
-
 if not pays_dispo:
-    st.error("Aucune donnée disponible. Importe un fichier ou télécharge via l'API.")
+    st.error("Aucune donnée disponible pour cette sélection.")
     st.stop()
 
-# Filtrer par période
 ts_debut = pd.Timestamp(date_debut.isoformat(), tz="UTC")
 ts_fin   = pd.Timestamp(date_fin.isoformat(),   tz="UTC") + pd.Timedelta(days=1)
 df_view  = db.loc[ts_debut:ts_fin, pays_dispo].copy()
 
 if df_view.empty:
-    st.warning("Pas de données pour cette période. Essaie une autre plage de dates.")
+    st.warning("Pas de données pour cette période.")
     st.stop()
 
-# Convertir en heure de Paris et appliquer la résolution
 df_view.index = df_view.index.tz_convert("Europe/Paris")
 df_view = resample(df_view, resolution)
 
 # ── Graphique ──────────────────────────────────────────────────────────────────
 fig = go.Figure()
-
 for nom in pays_dispo:
     idx   = list(PAYS.values()).index(nom) if nom in PAYS.values() else 0
     color = PALETTE[idx % len(PALETTE)]
@@ -400,43 +399,37 @@ for nom in pays_dispo:
         mode="lines",
     ))
 
-fig.update_layout(
-    height=520,
-    hovermode="x unified",
-    margin=dict(l=10, r=10, t=30, b=10),
-)
+fig.update_layout(height=520, hovermode="x unified", margin=dict(l=10, r=10, t=30, b=10))
 fig.update_xaxes(rangeslider_visible=True)
 fig.update_yaxes(title_text="€/MWh")
-
 st.plotly_chart(fig, use_container_width=True)
 
 # ── Statistiques ───────────────────────────────────────────────────────────────
-st.markdown("### 📊 Statistiques sur la période")
-
-stats_rows = []
+st.markdown("### 📊 Statistiques")
+rows = []
 for nom in pays_dispo:
     sr = df_view[nom].dropna()
     if len(sr) == 0:
         continue
-    stats_rows.append({
-        "Pays":              nom,
-        "Moyenne (€/MWh)":  round(float(sr.mean()), 1),
-        "Médiane":          round(float(sr.median()), 1),
-        "Min":              round(float(sr.min()), 1),
-        "Max":              round(float(sr.max()), 1),
-        "Heures ≤ 0":      int((sr <= 0).sum()),
-        "% heures ≤ 0":    f"{(sr <= 0).mean()*100:.1f} %",
+    rows.append({
+        "Pays":             nom,
+        "Moyenne (€/MWh)": round(float(sr.mean()), 1),
+        "Médiane":         round(float(sr.median()), 1),
+        "Min":             round(float(sr.min()), 1),
+        "Max":             round(float(sr.max()), 1),
+        "Heures ≤ 0":     int((sr <= 0).sum()),
+        "% heures ≤ 0":   f"{(sr <= 0).mean()*100:.1f} %",
     })
 
-if stats_rows:
-    df_stats = pd.DataFrame(stats_rows).set_index("Pays")
+if rows:
+    df_stats = pd.DataFrame(rows).set_index("Pays")
 
     def color_mean(v):
         try:
             f = float(str(v).replace(",", "."))
-            if f < 0:     return "background-color:#7f1d1d;color:white"
-            elif f < 30:  return "background-color:#1a3a2a;color:white"
-            elif f > 150: return "background-color:#451a03;color:white"
+            if f < 0:   return "background-color:#7f1d1d;color:white"
+            if f < 30:  return "background-color:#1a3a2a;color:white"
+            if f > 150: return "background-color:#451a03;color:white"
         except Exception:
             pass
         return ""
@@ -454,10 +447,5 @@ if stats_rows:
         )
         st.info(f"⚠️ **{total_neg} heures à prix nul ou négatif** — {detail}")
 
-# ── Footer ─────────────────────────────────────────────────────────────────────
 st.markdown("---")
-st.caption(
-    f"Base locale : {db_info(db)}  ·  "
-    "Données ENTSO-E Transparency Platform  ·  "
-    "Prix Day-Ahead SDAC (ex-PCR) en €/MWh"
-)
+st.caption(f"Données ENTSO-E · Prix Day-Ahead SDAC · Base R2 : {db_info(db)}")
