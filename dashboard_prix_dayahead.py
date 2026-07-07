@@ -469,7 +469,7 @@ if not db.empty:
                 buf_xl = io.BytesIO()
                 # Index en heure Paris pour lisibilité dans Excel
                 df_xl = db.copy()
-                df_xl.index = df_xl.index.tz_convert("Europe/Paris")
+                df_xl.index = df_xl.index.tz_convert("Europe/Paris").tz_localize(None)
                 df_xl.index.name = "timestamp (heure Paris)"
                 df_xl.to_excel(buf_xl, engine="openpyxl")
                 buf_xl.seek(0)
@@ -491,6 +491,8 @@ if not db.empty:
             with st.spinner("Génération Excel (période)…"):
                 buf_xl2 = io.BytesIO()
                 df_xl2 = df_view.copy()
+                if df_xl2.index.tz is not None:
+                    df_xl2.index = df_xl2.index.tz_convert("Europe/Paris").tz_localize(None)
                 df_xl2.index.name = "timestamp (heure Paris)"
                 df_xl2.to_excel(buf_xl2, engine="openpyxl")
                 buf_xl2.seek(0)
