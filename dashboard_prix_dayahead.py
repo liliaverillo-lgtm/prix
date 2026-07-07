@@ -461,26 +461,23 @@ if not db.empty:
         )
         st.caption("⚡ Rapide · Petit fichier · Pour Python")
 
-    # ── Excel (lent) ───────────────────────────────────────────────────────
+    # ── CSV complet (compatible Excel) ────────────────────────────────────
     with col2:
-        if st.button("⬇️ Préparer le fichier Excel", use_container_width=True,
-                     help="Génération plus longue (~30-60 sec selon la taille)."):
-            with st.spinner("Génération Excel en cours… (peut prendre jusqu'à 1 min)"):
-                buf_xl = io.BytesIO()
-                # Index en heure Paris pour lisibilité dans Excel
-                df_xl = db.copy()
-                df_xl.index = df_xl.index.tz_convert("Europe/Paris").strftime("%Y-%m-%d %H:%M")
-                df_xl.index.name = "timestamp (heure Paris)"
-                df_xl.to_excel(buf_xl, engine="openpyxl")
-                buf_xl.seek(0)
-            st.download_button(
-                label="📥 Cliquer ici pour télécharger le Excel",
-                data=buf_xl,
-                file_name="prix_dayahead_europe.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                use_container_width=True,
-            )
-        st.caption("🐢 Lent · Gros fichier · Pour Excel")
+        df_csv = db.copy()
+        df_csv.index = df_csv.index.tz_convert("Europe/Paris").strftime("%Y-%m-%d %H:%M")
+        df_csv.index.name = "timestamp (heure Paris)"
+        buf_csv = io.BytesIO()
+        df_csv.to_csv(buf_csv, encoding="utf-8-sig")  # utf-8-sig = compatible Excel
+        buf_csv.seek(0)
+        st.download_button(
+            label="⬇️ Télécharger en CSV (compatible Excel)",
+            data=buf_csv,
+            file_name="prix_dayahead_europe.csv",
+            mime="text/csv",
+            use_container_width=True,
+            help="S'ouvre directement dans Excel. Instantané, sans limite de taille.",
+        )
+        st.caption("⚡ Rapide · Compatible Excel · Tous pays")
 
     # ── Excel sur la période affichée uniquement ───────────────────────────
     st.markdown("---")
