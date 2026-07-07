@@ -147,9 +147,15 @@ def pays_manquants_pour_periode(db: pd.DataFrame,
                                  start: date,
                                  end: date) -> list:
     """
-    Retourne les pays dont les données sont absentes ou incomplètes
+    Retourne uniquement les pays qui n'ont AUCUNE donnée
     sur la période demandée.
+    On ne re-fetche pas si des données existent déjà,
+    même partiellement — l'utilisateur peut uploader un fichier
+    plus récent si besoin.
     """
+    if db.empty:
+        return pays_list
+
     manquants = []
     ts_start = pd.Timestamp(start.isoformat(), tz="UTC")
     ts_end   = pd.Timestamp(end.isoformat(),   tz="UTC") + pd.Timedelta(days=1)
@@ -158,10 +164,9 @@ def pays_manquants_pour_periode(db: pd.DataFrame,
         if pays not in db.columns:
             manquants.append(pays)
             continue
-        # Vérifier si la période est couverte
+        # Seulement si aucune donnée du tout dans la période
         sr = db.loc[ts_start:ts_end, pays].dropna()
-        heures_attendues = int((ts_end - ts_start).total_seconds() / 3600) - 1
-        if len(sr) < heures_attendues * 0.9:   # tolérance 10% (jours DST etc.)
+        if len(sr) == 0:
             manquants.append(pays)
 
     return manquants
@@ -236,31 +241,6 @@ def resample(df: pd.DataFrame, freq: str) -> pd.DataFrame:
 
 with st.sidebar:
     st.markdown("## ⚡ Prix Day-Ahead")
-    st.markdown("---")
-
-    # ── Upload ─────────────────────────────────────────────────────────────────
-    st.markdown("### 📂 Importer des données")
-    uploaded = st.file_uploader(
-        "Fichier Parquet (index datetime, colonnes = pays)",
-        type=["parquet"],
-        help="Produit par le script de téléchargement — directement compatible.",
-    )
-    if uploaded is not None:
-        try:
-            df_up = pd.read_parquet(uploaded)
-            df_up.index = pd.to_datetime(df_up.index, utc=True)
-            df_up.index.name = "timestamp"
-            # Invalider le cache /tmp/ pour forcer le rechargement
-            if os.path.exists(LOCAL_TMP):
-                os.remove(LOCAL_TMP)
-            merged = merge_into_db(df_up)
-            st.success(
-                f"✓ {df_up.shape[1]} pays importés · {df_up.shape[0]:,} lignes\n\n"
-                f"R2 mis à jour : {db_info(merged)}"
-            )
-        except Exception as e:
-            st.error(f"Erreur lors de l'import : {e}")
-
     st.markdown("---")
 
     # ── Dates ──────────────────────────────────────────────────────────────────
@@ -384,6 +364,10 @@ if df_view.empty:
     st.stop()
 
 df_view.index = df_view.index.tz_convert("Europe/Paris")
+
+# df_raw = données horaires brutes (pour les stats et heures négatives)
+# df_view = données rééchantillonnées (pour le graphique uniquement)
+df_raw  = df_view.copy()
 df_view = resample(df_view, resolution)
 
 # ── Graphique ──────────────────────────────────────────────────────────────────
@@ -406,9 +390,11 @@ st.plotly_chart(fig, use_container_width=True)
 
 # ── Statistiques ───────────────────────────────────────────────────────────────
 st.markdown("### 📊 Statistiques")
+# Stats toujours calculées sur les données HORAIRES (df_raw)
+# quelle que soit la résolution d'affichage du graphique
 rows = []
 for nom in pays_dispo:
-    sr = df_view[nom].dropna()
+    sr = df_raw[nom].dropna()
     if len(sr) == 0:
         continue
     rows.append({
@@ -439,13 +425,88 @@ if rows:
         use_container_width=True,
     )
 
-    total_neg = sum(int((df_view[n] <= 0).sum()) for n in pays_dispo)
+    total_neg = sum(int((df_raw[n] <= 0).sum()) for n in pays_dispo)
     if total_neg > 0:
         detail = " · ".join(
-            f"{n} : {int((df_view[n] <= 0).sum())}h"
-            for n in pays_dispo if (df_view[n] <= 0).any()
+            f"{n} : {int((df_raw[n] <= 0).sum())}h"
+            for n in pays_dispo if (df_raw[n] <= 0).any()
         )
         st.info(f"⚠️ **{total_neg} heures à prix nul ou négatif** — {detail}")
+
+# ── Télécharger la base complète ──────────────────────────────────────────────
+st.markdown("### 💾 Télécharger les données")
+
+if not db.empty:
+    import io
+    info_base = (
+        f"{db.shape[1]} pays · {db.shape[0]:,} lignes · "
+        f"{db.index.min().strftime('%d/%m/%Y')} → {db.index.max().strftime('%d/%m/%Y')}"
+    )
+    st.caption(f"Base disponible : {info_base}")
+
+    col1, col2 = st.columns(2)
+
+    # ── Parquet (rapide) ───────────────────────────────────────────────────
+    with col1:
+        buf_pq = io.BytesIO()
+        db.to_parquet(buf_pq)
+        buf_pq.seek(0)
+        st.download_button(
+            label="⬇️ Télécharger en Parquet",
+            data=buf_pq,
+            file_name="prix_dayahead_europe.parquet",
+            mime="application/octet-stream",
+            use_container_width=True,
+            help="Format compact — recommandé pour Python/Pandas. Génération instantanée.",
+        )
+        st.caption("⚡ Rapide · Petit fichier · Pour Python")
+
+    # ── Excel (lent) ───────────────────────────────────────────────────────
+    with col2:
+        if st.button("⬇️ Préparer le fichier Excel", use_container_width=True,
+                     help="Génération plus longue (~30-60 sec selon la taille)."):
+            with st.spinner("Génération Excel en cours… (peut prendre jusqu'à 1 min)"):
+                buf_xl = io.BytesIO()
+                # Index en heure Paris pour lisibilité dans Excel
+                df_xl = db.copy()
+                df_xl.index = df_xl.index.tz_convert("Europe/Paris")
+                df_xl.index.name = "timestamp (heure Paris)"
+                df_xl.to_excel(buf_xl, engine="openpyxl")
+                buf_xl.seek(0)
+            st.download_button(
+                label="📥 Cliquer ici pour télécharger le Excel",
+                data=buf_xl,
+                file_name="prix_dayahead_europe.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True,
+            )
+        st.caption("🐢 Lent · Gros fichier · Pour Excel")
+
+    # ── Excel sur la période affichée uniquement ───────────────────────────
+    st.markdown("---")
+    col3, col4 = st.columns(2)
+    with col3:
+        if st.button("⬇️ Préparer Excel — période sélectionnée", use_container_width=True,
+                     help=f"Uniquement du {date_debut} au {date_fin} pour les pays sélectionnés."):
+            with st.spinner("Génération Excel (période)…"):
+                buf_xl2 = io.BytesIO()
+                df_xl2 = df_view.copy()
+                df_xl2.index.name = "timestamp (heure Paris)"
+                df_xl2.to_excel(buf_xl2, engine="openpyxl")
+                buf_xl2.seek(0)
+            st.download_button(
+                label="📥 Télécharger Excel — période",
+                data=buf_xl2,
+                file_name=f"prix_dayahead_{date_debut}_{date_fin}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True,
+            )
+    with col4:
+        st.caption(
+            f"Période : {date_debut.strftime('%d/%m/%Y')} → {date_fin.strftime('%d/%m/%Y')}\n\n"
+            f"Pays : {', '.join(pays_dispo)}\n\n"
+            f"Résolution : {resolution}"
+        )
 
 st.markdown("---")
 st.caption(f"Données ENTSO-E · Prix Day-Ahead SDAC · Base R2 : {db_info(db)}")
