@@ -461,23 +461,27 @@ if not db.empty:
         )
         st.caption("⚡ Rapide · Petit fichier · Pour Python")
 
-    # ── CSV complet (compatible Excel) ────────────────────────────────────
+    # ── Excel complet (toute la période, tous pays) ───────────────────────
     with col2:
-        df_csv = db.copy()
-        df_csv.index = df_csv.index.tz_convert("Europe/Paris").strftime("%Y-%m-%d %H:%M")
-        df_csv.index.name = "timestamp (heure Paris)"
-        buf_csv = io.BytesIO()
-        df_csv.to_csv(buf_csv, encoding="utf-8-sig")  # utf-8-sig = compatible Excel
-        buf_csv.seek(0)
-        st.download_button(
-            label="⬇️ Télécharger en CSV (compatible Excel)",
-            data=buf_csv,
-            file_name="prix_dayahead_europe.csv",
-            mime="text/csv",
-            use_container_width=True,
-            help="S'ouvre directement dans Excel. Instantané, sans limite de taille.",
-        )
-        st.caption("⚡ Rapide · Compatible Excel · Tous pays")
+        if st.button("⬇️ Préparer Excel — toute la période", use_container_width=True,
+                     help="Toute la base R2 (tous les pays, toutes les dates) au format Excel."):
+            with st.spinner("Génération Excel (base complète)…"):
+                df_xl = db.copy()
+                df_xl.index = df_xl.index.tz_convert("Europe/Paris").strftime("%Y-%m-%d %H:%M")
+                df_xl.index.name = "timestamp (heure Paris)"
+                buf_xl = io.BytesIO()
+                df_xl.to_excel(buf_xl, engine="openpyxl")
+                buf_xl.seek(0)
+                st.session_state["xl_full"] = buf_xl.getvalue()
+        if "xl_full" in st.session_state:
+            st.download_button(
+                label="📥 Télécharger Excel — toute la période",
+                data=st.session_state["xl_full"],
+                file_name="prix_dayahead_europe.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True,
+            )
+        st.caption("📊 Format Excel · Tous pays · Toutes les dates")
 
     # ── Excel sur la période affichée uniquement ───────────────────────────
     st.markdown("---")
