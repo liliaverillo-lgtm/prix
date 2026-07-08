@@ -21,6 +21,7 @@ Lancer :
     streamlit run dashboard_prix_dayahead.py
 """
 
+import io
 import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, timedelta
@@ -433,11 +434,42 @@ if rows:
         )
         st.info(f"⚠️ **{total_neg} heures à prix nul ou négatif** — {detail}")
 
+# ══════════════════════════════════════════════════════════════════════════════
+#  EXPORT EXCEL (mis en cache : régénéré seulement si les données changent)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _df_to_excel_bytes(df: pd.DataFrame) -> bytes:
+    """DataFrame → .xlsx : index en texte heure de Paris, tz/inf nettoyés."""
+    out = df.copy()
+    if getattr(out.index, "tz", None) is not None:
+        out.index = out.index.tz_convert("Europe/Paris")
+    out.index = out.index.strftime("%Y-%m-%d %H:%M")
+    out.index.name = "timestamp (heure Paris)"
+    for c in out.columns:
+        if isinstance(out[c].dtype, pd.DatetimeTZDtype):
+            out[c] = out[c].dt.tz_localize(None)
+    out = out.replace([float("inf"), float("-inf")], pd.NA)
+    buf = io.BytesIO()
+    out.to_excel(buf, engine="openpyxl")
+    return buf.getvalue()
+
+
+@st.cache_data(show_spinner="Génération Excel…")
+def build_excel_full(db: pd.DataFrame) -> bytes:
+    """Excel de toute la base (mis en cache tant que la base ne change pas)."""
+    return _df_to_excel_bytes(db)
+
+
+@st.cache_data(show_spinner="Génération Excel…")
+def build_excel_period(df_view: pd.DataFrame) -> bytes:
+    """Excel de la période/sélection affichée (mis en cache par combinaison)."""
+    return _df_to_excel_bytes(df_view)
+
+
 # ── Télécharger la base complète ──────────────────────────────────────────────
 st.markdown("### 💾 Télécharger les données")
 
 if not db.empty:
-    import io
     info_base = (
         f"{db.shape[1]} pays · {db.shape[0]:,} lignes · "
         f"{db.index.min().strftime('%d/%m/%Y')} → {db.index.max().strftime('%d/%m/%Y')}"
@@ -463,61 +495,28 @@ if not db.empty:
 
     # ── Excel complet (toute la période, tous pays) ───────────────────────
     with col2:
-        if st.button("⬇️ Préparer Excel — toute la période", use_container_width=True,
-                     help="Toute la base R2 (tous les pays, toutes les dates) au format Excel."):
-            with st.spinner("Génération Excel (base complète)…"):
-                df_xl = db.copy()
-                # Index -> texte en heure de Paris (Excel n'accepte pas les tz)
-                if getattr(df_xl.index, "tz", None) is not None:
-                    df_xl.index = df_xl.index.tz_convert("Europe/Paris")
-                df_xl.index = df_xl.index.strftime("%Y-%m-%d %H:%M")
-                df_xl.index.name = "timestamp (heure Paris)"
-                # Toute colonne datetime tz-aware -> tz-naive (sinon Excel plante)
-                for _c in df_xl.columns:
-                    if isinstance(df_xl[_c].dtype, pd.DatetimeTZDtype):
-                        df_xl[_c] = df_xl[_c].dt.tz_localize(None)
-                # Excel n'accepte pas inf / -inf
-                df_xl = df_xl.replace([float("inf"), float("-inf")], pd.NA)
-                buf_xl = io.BytesIO()
-                df_xl.to_excel(buf_xl, engine="openpyxl")
-                buf_xl.seek(0)
-                st.session_state["xl_full"] = buf_xl.getvalue()
-        if "xl_full" in st.session_state:
-            st.download_button(
-                label="📥 Télécharger Excel — toute la période",
-                data=st.session_state["xl_full"],
-                file_name="prix_dayahead_europe.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                use_container_width=True,
-            )
+        st.download_button(
+            label="⬇️ Télécharger en Excel — toute la période",
+            data=build_excel_full(db),
+            file_name="prix_dayahead_europe.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True,
+            help="Toute la base R2 (tous les pays, toutes les dates) au format Excel.",
+        )
         st.caption("📊 Format Excel · Tous pays · Toutes les dates")
 
     # ── Excel sur la période affichée uniquement ───────────────────────────
     st.markdown("---")
     col3, col4 = st.columns(2)
     with col3:
-        if st.button("⬇️ Préparer Excel — période sélectionnée", use_container_width=True,
-                     help=f"Uniquement du {date_debut} au {date_fin} pour les pays sélectionnés."):
-            with st.spinner("Génération Excel (période)…"):
-                buf_xl2 = io.BytesIO()
-                df_xl2 = df_view.copy()
-                if getattr(df_xl2.index, "tz", None) is not None:
-                    df_xl2.index = df_xl2.index.tz_convert("Europe/Paris")
-                df_xl2.index = df_xl2.index.strftime("%Y-%m-%d %H:%M")
-                df_xl2.index.name = "timestamp (heure Paris)"
-                for _c in df_xl2.columns:
-                    if isinstance(df_xl2[_c].dtype, pd.DatetimeTZDtype):
-                        df_xl2[_c] = df_xl2[_c].dt.tz_localize(None)
-                df_xl2 = df_xl2.replace([float("inf"), float("-inf")], pd.NA)
-                df_xl2.to_excel(buf_xl2, engine="openpyxl")
-                buf_xl2.seek(0)
-            st.download_button(
-                label="📥 Télécharger Excel — période",
-                data=buf_xl2,
-                file_name=f"prix_dayahead_{date_debut}_{date_fin}.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                use_container_width=True,
-            )
+        st.download_button(
+            label="⬇️ Télécharger Excel — période sélectionnée",
+            data=build_excel_period(df_view),
+            file_name=f"prix_dayahead_{date_debut}_{date_fin}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True,
+            help=f"Uniquement du {date_debut} au {date_fin} pour les pays sélectionnés.",
+        )
     with col4:
         st.caption(
             f"Période : {date_debut.strftime('%d/%m/%Y')} → {date_fin.strftime('%d/%m/%Y')}\n\n"
