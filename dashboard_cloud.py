@@ -1,0 +1,1452 @@
+#!/usr/bin/env python3
+"""
+Dashboard — Modulation nucléaire par réacteur (France)
+Normalisation par la puissance nominale IAEA PRIS
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+CACHE CLOUDFLARE R2  (Parquet + JSON)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Les données sont persistées sur Cloudflare R2 (API S3-compatible) :
+  nucleaire_production.parquet     — production par réacteur (wide format,
+                                     index DatetimeTZ Europe/Paris)
+  nucleaire_jours.json             — métadonnées des jours chargés
+                                     {jour_str: {charge_ts, est_complet}}
+  remit_indispo_nucleaire.parquet  — historique REMIT des indisponibilités EDF
+                                     (arrêts fortuits/planifiés, chroniques
+                                     PMIN/aFRR/simples). Déposé une fois sur R2
+                                     via la sidebar, lu à chaque chargement.
+
+Flux de mise à jour :
+  1. L'app télécharge le Parquet R2 en mémoire (BytesIO) — < 1 s.
+  2. Algorithme deux-pointeurs → identifie les jours manquants.
+  3. Requête ENTSO-E ciblée sur les jours manquants (2-3 s).
+  4. Fusion en mémoire : nouvelles lignes ajoutées au DataFrame.
+  5. Affichage complet des graphiques.
+  6. Upload du Parquet mis à jour vers R2 — < 1 s.
+
+L'enregistrement R2 (étape 6) a lieu APRÈS l'affichage (étape 5).
+Entre deux utilisations le cache survit aux redémarrages Streamlit Cloud.
+
+CONFIGURATION — .streamlit/secrets.toml
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+[cloudflare]
+R2_ENDPOINT_URL       = "https://<account-id>.r2.cloudflarestorage.com"
+R2_ACCESS_KEY_ID      = "votre-r2-access-key-id"
+R2_SECRET_ACCESS_KEY  = "votre-r2-secret-access-key"
+R2_BUCKET_NAME        = "nucleaire-dashboard"
+
+REQUIREMENTS (requirements.txt)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+entsoe-py
+pandas
+pyarrow
+plotly
+streamlit
+boto3
+
+ALGORITHME DE RECHERCHE SÉQUENTIELLE DU CACHE (deux pointeurs)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Listes « jours demandés » et « jours disponibles » sont toutes deux triées.
+Un seul pointeur parcourt les disponibles, sans jamais revenir en arrière.
+Pour chercher le j-ème jour, on repart du pointeur laissé par le (j-1)-ème :
+  → pas de re-scan inutile des jours précédents.
+  → complexité O(n + m) au lieu de O(n × m).
+
+OPTIMISATIONS
+━━━━━━━━━━━━━
+[Cache R2]
+ 1.  Client ENTSO-E partagé via @st.cache_resource (1 seul handshake TLS)
+ 2.  Client boto3 R2 partagé via @st.cache_resource
+ 3.  Vérification cache par algorithme deux-pointeurs (O(n+m))
+ 4.  charger_depuis_parquet_cache mis en cache via @st.cache_data
+ 5.  sauvegarder_batch_en_r2 : download → merge → upload en 1 seul bloc R2
+ 6.  _parquet_lock : sécurité thread pour le cycle read-modify-write R2
+ 7.  Enregistrement R2 après affichage (pas de sauvegarde partielle)
+
+[ENTSO-E]
+ A.  Requêtes multi-jours par blocs de 7 (jusqu'à 7× moins de requêtes HTTP)
+ B.  Parallélisme conditionnel sur les blocs (ThreadPool si > 1 bloc)
+ C.  Slider sidebar pour ajuster le parallélisme (2 / 4 / 6 / 8 workers)
+
+[UX]
+ D.  Bouton Rafraîchir grisé pendant le téléchargement (session_state + rerun)
+
+[Plotly / rendu]
+ 8.  Graphique en marche/arrêtés (area empilée, hover unifié)
+ 9.  Résolution adaptive (1h / 2h / 3h selon nb_jours)
+ 10. Sparklines : hovertemplate allégé sans customdata
+ 11. Shapes hline limitées aux 56 premiers sous-graphiques
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+"""
+
+import warnings
+warnings.filterwarnings("ignore")
+
+import io
+import json
+import math
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timedelta, date
+
+import boto3
+from botocore.exceptions import ClientError
+import streamlit as st
+import pandas as pd
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+from entsoe import EntsoePandasClient
+
+# ══════════════════════════════════════════════════════════════════
+# 0. CONFIGURATION
+# ══════════════════════════════════════════════════════════════════
+
+API_KEY           = "c5cb3857-bc40-4f4c-a4db-088946785b4a"
+COUNTRY           = "FR"
+TZ                = "Europe/Paris"
+SEUIL_ON_PCT      = 5
+N_COLS_SPARKLINES = 4
+BLOC_JOURS        = 7    # taille des blocs pour les requêtes ENTSO-E multi-jours
+MAX_SHAPES        = 56   # limite des hlines décoratifs dans les sparklines
+
+# ── Clés des objets R2 ────────────────────────────────────────────
+R2_PARQUET_KEY = "nucleaire_production.parquet"
+R2_META_KEY    = "nucleaire_jours.json"
+# Historique des indisponibilités REMIT (EDF) — même bucket que la production.
+# Ce fichier est déposé une fois sur R2 (upload manuel ou via la sidebar).
+R2_REMIT_KEY   = "remit_indispo_nucleaire.parquet"
+
+# ── Catégories d'indisponibilité REMIT ────────────────────────────
+# Ordre = priorité d'affectation : un réacteur qui cumule plusieurs
+# déclarations actives au même instant est compté dans la catégorie la
+# plus « haute » de cette liste (un arrêt prime sur une chronique).
+# Chaque entrée : clé interne → (libellé, couleur, types REMIT regroupés)
+REMIT_CATEGORIES = {
+    "fortuit"   : ("Arrêt fortuit",    "#E53935", {"Fortuite", "Fortuite (pompe)"}),
+    "planifie"  : ("Arrêt planifié",   "#FB8C00", {"Planifiée", "Planifiée (pompe)"}),
+    "pmin"      : ("Chronique PMIN",   "#FDD835", {"Chronique PMIN"}),
+    "afrr"      : ("Chronique aFRR",   "#42A5F5", {"Chronique aFRR"}),
+    "chronique" : ("Chronique simple", "#26A69A", {"Chronique", "Chronique."}),
+}
+# Priorité décroissante (le 1er qui matche gagne)
+REMIT_PRIORITE = ["fortuit", "planifie", "pmin", "afrr", "chronique"]
+
+PUISSANCE_NOMINALE_MW = {
+    "BUGEY 2": 910,      "BUGEY 3": 910,      "BUGEY 4": 880,      "BUGEY 5": 880,
+    "BLAYAIS 1": 910,    "BLAYAIS 2": 910,    "BLAYAIS 3": 910,    "BLAYAIS 4": 910,
+    "CHINON 1": 905,     "CHINON 2": 905,     "CHINON 3": 905,     "CHINON 4": 905,
+    "CRUAS 1": 915,      "CRUAS 2": 915,      "CRUAS 3": 915,      "CRUAS 4": 915,
+    "DAMPIERRE 1": 890,  "DAMPIERRE 2": 890,  "DAMPIERRE 3": 890,  "DAMPIERRE 4": 890,
+    "GRAVELINES 1": 910, "GRAVELINES 2": 910, "GRAVELINES 3": 910,
+    "GRAVELINES 4": 910, "GRAVELINES 5": 910, "GRAVELINES 6": 910,
+    "ST LAURENT 1": 915, "ST LAURENT 2": 915,
+    "TRICASTIN 1": 915,  "TRICASTIN 2": 915,  "TRICASTIN 3": 915,  "TRICASTIN 4": 915,
+    "FLAMANVILLE 1": 1310, "FLAMANVILLE 2": 1310,
+    "PALUEL 1": 1330,    "PALUEL 2": 1330,    "PALUEL 3": 1330,    "PALUEL 4": 1330,
+    "ST ALBAN 1": 1335,  "ST ALBAN 2": 1335,
+    "BELLEVILLE 1": 1310, "BELLEVILLE 2": 1310,
+    "CATTENOM 1": 1300,  "CATTENOM 2": 1300,  "CATTENOM 3": 1300,  "CATTENOM 4": 1300,
+    "GOLFECH 1": 1310,   "GOLFECH 2": 1310,
+    "NOGENT 1": 1310,    "NOGENT 2": 1310,
+    "PENLY 1": 1320,     "PENLY 2": 1320,
+    "CHOOZ 1": 1500,     "CHOOZ 2": 1500,
+    "CIVAUX 1": 1495,    "CIVAUX 2": 1495,
+    "FLAMANVILLE 3": 1630,
+}
+
+AUJOURDHUI    = datetime.now().date()
+HIER          = AUJOURDHUI - timedelta(days=1)
+_parquet_lock = threading.Lock()   # protège le cycle download-merge-upload R2
+
+# ══════════════════════════════════════════════════════════════════
+# 1. EXTRACTION ENTSO-E
+# ══════════════════════════════════════════════════════════════════
+
+def _dedup_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Fusionne les colonnes dupliquées en prenant le max element-wise (patch ENTSO-E).
+
+    Implémentation sans transposition : pour chaque nom de colonne, on sélectionne
+    toutes les colonnes portant ce nom et on en prend le max ligne par ligne.
+    Évite le double .T qui détruit l'organisation mémoire sur les grands DataFrames
+    et est incompatible avec groupby(axis=1) supprimé en pandas 2.x.
+    """
+    if not df.columns.duplicated().any():
+        return df
+    unique_cols = list(dict.fromkeys(df.columns))   # ordre préservé, doublons retirés
+    return pd.DataFrame(
+        {c: df.loc[:, df.columns == c].max(axis=1) for c in unique_cols},
+        index=df.index,
+    )
+
+
+def extraire_actual_aggregated(df: pd.DataFrame) -> pd.DataFrame:
+    """MultiIndex ENTSO-E → DataFrame wide (réacteur → MW)."""
+    if isinstance(df.columns, pd.MultiIndex):
+        niv0 = df.columns.get_level_values(0).astype(str)
+        niv1 = df.columns.get_level_values(1).astype(str)
+        m1   = niv1.str.contains("Aggregated", case=False, na=False)
+        m0   = niv0.str.contains("Aggregated", case=False, na=False)
+        if m1.any():
+            out = df.loc[:, m1].copy(); out.columns = out.columns.droplevel(1)
+        elif m0.any():
+            out = df.loc[:, m0].copy(); out.columns = out.columns.droplevel(0)
+        else:
+            out = df.copy(); out.columns = niv0
+    else:
+        out = df.copy()
+    out.columns = [str(c) for c in out.columns]
+    out = _dedup_columns(out)
+    return out
+
+# ══════════════════════════════════════════════════════════════════
+# 2. CACHE CLOUDFLARE R2
+# ══════════════════════════════════════════════════════════════════
+
+# ── Client R2 partagé ─────────────────────────────────────────────
+
+@st.cache_resource(show_spinner=False)
+def get_r2_client():
+    """Client boto3 S3 pointant sur Cloudflare R2 (1 seul handshake TLS par session)."""
+    return boto3.client(
+        "s3",
+        endpoint_url=st.secrets["cloudflare"]["R2_ENDPOINT_URL"],
+        aws_access_key_id=st.secrets["cloudflare"]["R2_ACCESS_KEY_ID"],
+        aws_secret_access_key=st.secrets["cloudflare"]["R2_SECRET_ACCESS_KEY"],
+        region_name="auto",
+    )
+
+
+def _bucket() -> str:
+    """Nom du bucket R2 (lu depuis st.secrets)."""
+    return st.secrets["cloudflare"]["R2_BUCKET_NAME"]
+
+# ── Primitives R2 ─────────────────────────────────────────────────
+
+def _r2_download(key: str) -> bytes | None:
+    """Télécharge un objet depuis R2. Retourne None si l'objet est absent."""
+    try:
+        resp = get_r2_client().get_object(Bucket=_bucket(), Key=key)
+        return resp["Body"].read()
+    except ClientError as e:
+        code = e.response["Error"]["Code"]
+        if code in ("NoSuchKey", "404", "NoSuchBucket"):
+            return None
+        raise
+
+
+def _r2_upload(key: str, data: bytes) -> None:
+    """Uploade un objet vers R2."""
+    get_r2_client().put_object(Bucket=_bucket(), Key=key, Body=data)
+
+
+def _r2_delete(key: str) -> None:
+    """Supprime un objet de R2 (silencieux si déjà absent)."""
+    try:
+        get_r2_client().delete_object(Bucket=_bucket(), Key=key)
+    except ClientError:
+        pass
+
+
+def _r2_exists(key: str) -> bool:
+    """Vérifie l'existence d'un objet R2 via HEAD (sans télécharger le contenu)."""
+    try:
+        get_r2_client().head_object(Bucket=_bucket(), Key=key)
+        return True
+    except ClientError:
+        return False
+
+# ── Lecture brute (sans cache Streamlit) ──────────────────────────
+
+def _load_parquet_raw() -> pd.DataFrame:
+    """Télécharge et décode le Parquet depuis R2 (non mis en cache Streamlit).
+
+    Retourne un DataFrame wide avec index DatetimeTZ (Europe/Paris),
+    ou un DataFrame vide si l'objet est absent / illisible.
+    Utilisé en interne pour les cycles lecture-modification-écriture.
+    """
+    data = _r2_download(R2_PARQUET_KEY)
+    if data is None:
+        return pd.DataFrame()
+    try:
+        df = pd.read_parquet(io.BytesIO(data))
+        if df.empty:
+            return pd.DataFrame()
+        if df.index.tz is None:
+            df.index = df.index.tz_localize(TZ)
+        elif str(df.index.tz) != TZ:
+            df.index = df.index.tz_convert(TZ)
+        return df
+    except Exception:
+        return pd.DataFrame()
+
+
+def _load_jours_meta_raw() -> dict:
+    """Télécharge et décode le JSON de métadonnées depuis R2 (non mis en cache).
+
+    Retourne un dict {jour_str: {"charge_ts": str, "est_complet": int}}.
+    """
+    data = _r2_download(R2_META_KEY)
+    if data is None:
+        return {}
+    try:
+        return json.loads(data.decode("utf-8"))
+    except Exception:
+        return {}
+
+# ── Recherche séquentielle (deux pointeurs) ───────────────────────
+
+def jours_cache_dict(start: date, end: date) -> dict[date, tuple[str, int]]:
+    """
+    Retourne les jours de [start, end] présents dans le cache R2.
+
+    Algorithme deux-pointeurs — O(n + m) :
+    ┌──────────────────────────────────────────────────────────────┐
+    │  « demandés »   : liste triée des jours de la période       │
+    │  « disponibles »: liste triée des jours en cache JSON       │
+    │                                                              │
+    │  ptr parcourt disponibles une seule fois (jamais en arrière) │
+    │  Pour le j-ème jour demandé, on repart de ptr laissé par    │
+    │  le (j-1)-ème, en avançant jusqu'au premier >= j.           │
+    └──────────────────────────────────────────────────────────────┘
+    Si le JSON ou le Parquet est absent sur R2, renvoie {} (tout à récupérer).
+    """
+    meta = _load_jours_meta_raw()
+    if not meta:
+        return {}
+    if not _r2_exists(R2_PARQUET_KEY):
+        return {}
+
+    available = sorted(date.fromisoformat(j) for j in meta)
+    requested = [start + timedelta(days=i) for i in range((end - start).days + 1)]
+
+    result: dict[date, tuple[str, int]] = {}
+    ptr = 0
+    n   = len(available)
+
+    for j in requested:
+        while ptr < n and available[ptr] < j:
+            ptr += 1
+        if ptr < n and available[ptr] == j:
+            m = meta[str(j)]
+            result[j] = (m["charge_ts"], m["est_complet"])
+            ptr += 1
+
+    return result
+
+# ── Écriture en batch ─────────────────────────────────────────────
+
+def sauvegarder_batch_en_r2(
+    resultats_par_jour: dict[date, pd.DataFrame],
+    df_existing: pd.DataFrame | None = None,
+) -> None:
+    """Persiste plusieurs jours dans le Parquet R2 en un seul cycle download-merge-upload.
+
+    df_existing : Parquet complet déjà en mémoire (évite un 2ème téléchargement R2).
+                  Si None, on télécharge depuis R2 (fallback).
+    Appelé APRÈS l'affichage des graphiques.
+    """
+    dfs_to_add: list[pd.DataFrame] = []
+    meta_updates: dict              = {}
+    now_iso = datetime.now().isoformat()
+    today   = datetime.now().date()
+
+    for jour, df_wide in resultats_par_jour.items():
+        if df_wide is None or df_wide.empty:
+            continue
+        if jour >= today:
+            continue  # Ne jamais persister aujourd'hui : données incomplètes
+        idx = df_wide.index
+        if idx.tz is None:
+            idx = idx.tz_localize("UTC")
+        df_j         = df_wide.copy()
+        df_j.index   = idx.tz_convert(TZ)
+        df_j.columns = [str(c) for c in df_j.columns]
+        df_j = _dedup_columns(df_j)
+        dfs_to_add.append(df_j)
+        meta_updates[str(jour)] = {"charge_ts": now_iso, "est_complet": 1}
+
+    if not dfs_to_add:
+        return
+
+    with _parquet_lock:
+        # 1. Utiliser le df passé en argument (déjà en mémoire) ou télécharger si absent
+        df_base = df_existing if (df_existing is not None and not df_existing.empty) \
+                  else _load_parquet_raw()
+
+        # 2. Fusionner en mémoire
+        df_new = pd.concat(dfs_to_add, axis=0)
+        df_new = df_new[~df_new.index.duplicated(keep="last")]
+
+        if not df_base.empty:
+            df_combined = pd.concat([df_base, df_new], axis=0, join="outer")
+            df_combined = df_combined[~df_combined.index.duplicated(keep="last")]
+            df_combined = df_combined.sort_index()
+            df_combined = _dedup_columns(df_combined)
+        else:
+            df_combined = df_new.sort_index()
+
+        # 3. Uploader le Parquet mis à jour vers R2
+        buf = io.BytesIO()
+        df_combined.to_parquet(buf)
+        _r2_upload(R2_PARQUET_KEY, buf.getvalue())
+
+        # 4. Mettre à jour et uploader le JSON de métadonnées
+        meta = _load_jours_meta_raw()
+        meta.update(meta_updates)
+        _r2_upload(
+            R2_META_KEY,
+            json.dumps(meta, ensure_ascii=False, indent=2).encode("utf-8"),
+        )
+
+    _charger_parquet_complet_cached.clear()
+    charger_depuis_parquet_cache.clear()
+
+# ── Lecture avec cache Streamlit ──────────────────────────────────
+
+@st.cache_data(show_spinner=False)
+def _charger_parquet_complet_cached() -> pd.DataFrame:
+    """Télécharge le Parquet COMPLET depuis R2 et le met en cache Streamlit.
+
+    Source unique vérité pour les lectures : charger_depuis_parquet_cache filtre
+    depuis ici, et sauvegarder_batch_en_r2 reçoit ce df en argument pour éviter
+    un second téléchargement. Un seul aller-retour R2 par session de chargement.
+    """
+    return _load_parquet_raw()
+
+
+@st.cache_data(show_spinner=False)
+def charger_depuis_parquet_cache(start: date, end: date) -> pd.DataFrame:
+    """Filtre le Parquet complet (déjà en cache) pour la période demandée.
+
+    Résultat mis en cache par Streamlit (@st.cache_data).
+    Invalidé par .clear() après chaque sauvegarde ou purge R2.
+    """
+    df_prod = _charger_parquet_complet_cached()
+    if df_prod.empty:
+        return pd.DataFrame()
+
+    borne_start = pd.Timestamp(str(start), tz=TZ)
+    borne_end   = pd.Timestamp(str(end) + " 23:59:59", tz=TZ)
+    mask = (df_prod.index >= borne_start) & (df_prod.index <= borne_end)
+    return df_prod.loc[mask].copy()
+
+# ── Statistiques & purge ──────────────────────────────────────────
+
+@st.cache_data(ttl=60, show_spinner=False)
+def stats_r2() -> dict:
+    """Statistiques sur le cache R2 — mises en cache 60 s (évite un download JSON à chaque rerun)."""
+    meta = _load_jours_meta_raw()
+    if not meta:
+        return {"n": 0, "min": None, "max": None}
+    jours = sorted(meta.keys())
+    return {"n": len(jours), "min": jours[0], "max": jours[-1]}
+
+
+def purger_periode_r2(start: date, end: date) -> int:
+    """Supprime les données de la période du cache R2 (Parquet + JSON).
+
+    Retourne le nombre de jours purgés.
+    """
+    jours = [start + timedelta(days=i) for i in range((end - start).days + 1)]
+
+    with _parquet_lock:
+        meta = _load_jours_meta_raw()
+        for j in jours:
+            meta.pop(str(j), None)
+        _r2_upload(
+            R2_META_KEY,
+            json.dumps(meta, ensure_ascii=False, indent=2).encode("utf-8"),
+        )
+
+        df_prod = _load_parquet_raw()
+        if not df_prod.empty:
+            borne_start = pd.Timestamp(str(start), tz=TZ)
+            borne_end   = pd.Timestamp(str(end) + " 23:59:59", tz=TZ)
+            mask    = (df_prod.index >= borne_start) & (df_prod.index <= borne_end)
+            df_prod = df_prod[~mask]
+            if df_prod.empty:
+                _r2_delete(R2_PARQUET_KEY)
+            else:
+                buf = io.BytesIO()
+                df_prod.to_parquet(buf)
+                _r2_upload(R2_PARQUET_KEY, buf.getvalue())
+
+    _charger_parquet_complet_cached.clear()
+    charger_depuis_parquet_cache.clear()
+    return len(jours)
+
+# ══════════════════════════════════════════════════════════════════
+# 2bis. DONNÉES REMIT (indisponibilités EDF)
+# ══════════════════════════════════════════════════════════════════
+
+def _remit_col(df: pd.DataFrame, *candidats: str) -> str:
+    """Retrouve le nom exact d'une colonne malgré le mojibake (é→È, è→Ë).
+
+    L'export REMIT contient des accents mal encodés ('FiliËre', 'Date de dÈbut').
+    On compare en supprimant les caractères non-ASCII pour être robuste.
+    """
+    def norm(s: str) -> str:
+        # ne garde que a-z / 0-9 → ignore accents ET mojibake (é, È, è…)
+        return "".join(c for c in s.lower() if c.isascii() and c.isalnum())
+    cibles = {norm(c) for c in candidats}
+    for col in df.columns:
+        if norm(col) in cibles:
+            return col
+    raise KeyError(f"Colonne introuvable parmi {candidats} · dispo : {list(df.columns)}")
+
+
+@st.cache_data(show_spinner=False)
+def charger_remit() -> pd.DataFrame:
+    """Charge et normalise l'historique REMIT nucléaire depuis R2.
+
+    Retourne un DataFrame trié avec colonnes normalisées :
+      nom · type · cat · deb · fin · status
+    où 'cat' est la clé de catégorie (fortuit/planifie/pmin/afrr/chronique).
+    Ne conserve que les déclarations Actives de la filière nucléaire.
+    DataFrame vide si le fichier REMIT est absent sur R2.
+    """
+    data = _r2_download(R2_REMIT_KEY)
+    if data is None:
+        return pd.DataFrame()
+    try:
+        raw = pd.read_parquet(io.BytesIO(data))
+    except Exception:
+        return pd.DataFrame()
+    if raw.empty:
+        return pd.DataFrame()
+
+    c_status = _remit_col(raw, "Status")
+    c_nom    = _remit_col(raw, "Nom")
+    c_fil    = _remit_col(raw, "Filiere", "FiliÈre", "FiliËre")
+    c_deb    = _remit_col(raw, "Date de debut", "Date de dÈbut")
+    c_fin    = _remit_col(raw, "Date de fin")
+    c_type   = _remit_col(raw, "Type")
+
+    df = raw[[c_status, c_nom, c_fil, c_deb, c_fin, c_type]].copy()
+    df.columns = ["status", "nom", "filiere", "deb", "fin", "type"]
+
+    # Filtre nucléaire + déclarations actives uniquement
+    df = df[df["filiere"].astype(str).str.contains("ucl", case=False, na=False)]
+    df = df[df["status"].astype(str).str.strip().str.lower() == "active"]
+    if df.empty:
+        return pd.DataFrame()
+
+    # Dates : sérial Excel (float) OU déjà datetime selon l'export
+    for col in ("deb", "fin"):
+        if pd.api.types.is_numeric_dtype(df[col]):
+            df[col] = pd.to_datetime(df[col], unit="D", origin="1899-12-30")
+        else:
+            df[col] = pd.to_datetime(df[col], errors="coerce")
+    df = df.dropna(subset=["deb", "fin"])
+
+    # Localisation Europe/Paris (les dates REMIT sont en heure locale FR)
+    for col in ("deb", "fin"):
+        if df[col].dt.tz is None:
+            df[col] = df[col].dt.tz_localize(TZ, ambiguous="NaT", nonexistent="shift_forward")
+        else:
+            df[col] = df[col].dt.tz_convert(TZ)
+    df = df.dropna(subset=["deb", "fin"])
+
+    # Affectation d'une catégorie à chaque déclaration.
+    # L'export REMIT peut contenir des accents mal encodés dans les valeurs
+    # de 'Type' ('PlanifiÈe' au lieu de 'Planifiée'). On normalise donc en
+    # supprimant les caractères non alphanumériques ASCII avant de comparer.
+    def _norm_type(s: str) -> str:
+        # ne garde que a-z / 0-9 → 'Planifiée' == 'PlanifiÈe' (mojibake)
+        return "".join(c for c in str(s).lower() if c.isascii() and c.isalnum())
+
+    type_to_cat = {}
+    for cat, (_lib, _col, types) in REMIT_CATEGORIES.items():
+        for t in types:
+            type_to_cat[_norm_type(t)] = cat
+
+    df["type"] = df["type"].astype(str).str.strip()
+    df["cat"]  = df["type"].map(lambda t: type_to_cat.get(_norm_type(t)))
+    df = df.dropna(subset=["cat"])
+
+    return df.sort_values("deb").reset_index(drop=True)
+
+
+def compter_indispo_par_categorie(
+    remit: pd.DataFrame, axe_temps: pd.DatetimeIndex
+) -> pd.DataFrame:
+    """Compte les réacteurs indisponibles par catégorie, à chaque pas de temps.
+
+    Pour chaque instant de `axe_temps`, on regarde toutes les déclarations REMIT
+    actives qui le recouvrent (deb ≤ t < fin). Un réacteur qui cumule plusieurs
+    déclarations au même instant est affecté à UNE seule catégorie, selon
+    REMIT_PRIORITE (un arrêt prime sur une chronique). On compte donc des
+    réacteurs distincts — pas des déclarations — pour éviter le double comptage.
+
+    Retourne un DataFrame indexé par axe_temps, une colonne par catégorie
+    (libellés lisibles), valeurs = nombre de réacteurs.
+    """
+    libelles = {cat: REMIT_CATEGORIES[cat][0] for cat in REMIT_PRIORITE}
+    out = pd.DataFrame(
+        0, index=axe_temps, columns=[libelles[c] for c in REMIT_PRIORITE], dtype=int
+    )
+    if remit.empty:
+        return out
+
+    rang = {cat: i for i, cat in enumerate(REMIT_PRIORITE)}
+    deb = remit["deb"].values
+    fin = remit["fin"].values
+    noms = remit["nom"].values
+    cats = remit["cat"].values
+
+    for t in axe_temps:
+        tv = pd.Timestamp(t).to_datetime64()
+        mask = (deb <= tv) & (fin > tv)
+        if not mask.any():
+            continue
+        # meilleure catégorie (plus prioritaire) par réacteur
+        best: dict[str, int] = {}
+        for nom, cat in zip(noms[mask], cats[mask]):
+            r = rang[cat]
+            if nom not in best or r < best[nom]:
+                best[nom] = r
+        # agrégation par catégorie
+        compte = [0] * len(REMIT_PRIORITE)
+        for r in best.values():
+            compte[r] += 1
+        for i, cat in enumerate(REMIT_PRIORITE):
+            out.at[t, libelles[cat]] = compte[i]
+
+    return out
+
+
+def uploader_remit_vers_r2(file_bytes: bytes) -> None:
+    """Dépose le fichier REMIT (.parquet) sur R2 et invalide le cache de lecture."""
+    _r2_upload(R2_REMIT_KEY, file_bytes)
+    charger_remit.clear()
+
+# ══════════════════════════════════════════════════════════════════
+# 3. API ENTSO-E
+# ══════════════════════════════════════════════════════════════════
+
+@st.cache_resource(show_spinner=False)
+def get_entsoe_client() -> EntsoePandasClient:
+    """Client ENTSO-E partagé (1 seul handshake TLS par session Streamlit)."""
+    return EntsoePandasClient(api_key=API_KEY)
+
+
+def _chunks(lst: list, n: int):
+    """Découpe lst en sous-listes de taille n."""
+    for i in range(0, len(lst), n):
+        yield lst[i:i + n]
+
+
+def api_telecharger_bloc(
+    bloc: list[date], client: EntsoePandasClient
+) -> dict[date, pd.DataFrame | None]:
+    """Télécharge un bloc de jours en 1 seule requête ENTSO-E.
+
+    Retourne un dict {jour: df_wide | None}.
+    """
+    start_ts = pd.Timestamp(str(bloc[0])  + " 00:00", tz=TZ)
+    end_ts   = pd.Timestamp(str(bloc[-1]) + " 23:59", tz=TZ)
+    try:
+        df_raw = client.query_generation_per_plant(
+            country_code=COUNTRY, start=start_ts, end=end_ts, psr_type="B14"
+        )
+    except Exception:
+        return {j: None for j in bloc}
+
+    if df_raw is None or df_raw.empty:
+        return {j: None for j in bloc}
+
+    df_wide   = extraire_actual_aggregated(df_raw)
+    resultats: dict[date, pd.DataFrame | None] = {}
+
+    for jour in bloc:
+        borne_s = pd.Timestamp(str(jour) + " 00:00", tz=TZ)
+        borne_e = pd.Timestamp(str(jour) + " 23:59", tz=TZ)
+        df_j    = df_wide[(df_wide.index >= borne_s) & (df_wide.index <= borne_e)]
+        resultats[jour] = df_j if not df_j.empty else None
+
+    return resultats
+
+# ══════════════════════════════════════════════════════════════════
+# 4. INTERFACE STREAMLIT
+# ══════════════════════════════════════════════════════════════════
+
+st.set_page_config(
+    page_title="☢️ Modulation nucléaire France",
+    layout="wide",
+    page_icon="☢️",
+)
+st.title("☢️ Modulation nucléaire par réacteur — France")
+st.caption(
+    "Production normalisée par la puissance nominale (IAEA PRIS) · "
+    "Cache : Cloudflare R2 · Données : ENTSO-E"
+)
+
+# ── CSS — sélecteur de plage en rose pâle ─────────────────────────
+st.markdown("""
+<style>
+div[data-baseweb="calendar"] button[aria-selected="true"],
+div[data-baseweb="calendar"] [aria-selected="true"] > button {
+    background-color: #c2185b !important;
+    color: #fff !important;
+    border-radius: 50% !important;
+}
+div[data-baseweb="calendar"] [data-highlighted="true"] button,
+div[data-baseweb="calendar"] div[data-highlighted="true"] button {
+    background-color: #fce4ec !important;
+    border-radius: 0 !important;
+}
+div[data-baseweb="calendar"] button:disabled {
+    opacity: 0.30 !important;
+    cursor: not-allowed !important;
+}
+</style>
+""", unsafe_allow_html=True)
+
+# ── Session state ────────────────────────────────────────────────
+# last_render : dict avec le df_brut sérialisé + métadonnées de la dernière
+#               période chargée. Permet de réafficher les données quand
+#               l'utilisateur change les dates sans avoir recliqué Rafraîchir.
+if "last_render" not in st.session_state:
+    st.session_state.last_render = None
+
+# ── Sidebar ───────────────────────────────────────────────────────
+with st.sidebar:
+    st.header("📅 Période")
+
+    dates = st.date_input(
+        "Sélectionner la plage",
+        value=[HIER - timedelta(days=6), HIER],
+        min_value=date(2015, 1, 1),
+        max_value=AUJOURDHUI,
+        format="DD/MM/YYYY",
+        help="Cliquez d'abord sur la date de début, puis sur la date de fin.",
+        key="date_input_range",
+    )
+
+    if isinstance(dates, date):
+        dates = (dates,)
+
+    if len(dates) < 2:
+        st.info("📅 Cliquez maintenant sur la date de fin.")
+        st.stop()
+
+    start_date, end_date = dates[0], dates[1]
+    nb_jours = (end_date - start_date).days + 1
+
+    st.info(f"📆 {nb_jours} jour(s) sélectionné(s)")
+    if nb_jours > 31:
+        st.warning("⚠️ Au-delà de 31 jours, le premier chargement peut être long.")
+
+    MAX_WORKERS_API = st.select_slider(
+        "⚡ Parallélisme API",
+        options=[2, 4, 6, 8],
+        value=4,
+        help="Nombre de blocs téléchargés simultanément depuis ENTSO-E. "
+             "Valeurs élevées = plus rapide mais risque de throttling.",
+    )
+
+    lancer = st.button("🔄 Rafraîchir", type="primary", use_container_width=True)
+
+    with st.expander("🗑️ Gestion du cache"):
+        st.caption("Force un re-téléchargement de la période sélectionnée.")
+        if st.button("Purger la période", use_container_width=True):
+            n = purger_periode_r2(start_date, end_date)
+            st.session_state.last_render = None   # données affichées devenues obsolètes
+            stats_r2.clear()                      # rafraîchit les stats sidebar immédiatement
+            st.toast(f"🗑️ {n} jour(s) supprimés du cache R2", icon="✅")
+
+    with st.expander("📥 Données REMIT (indispo. EDF)"):
+        remit_present = _r2_exists(R2_REMIT_KEY)
+        if remit_present:
+            st.caption("✅ Fichier REMIT présent sur R2.")
+        else:
+            st.caption("⚠️ Aucun fichier REMIT sur R2. Déposez le .parquet ci-dessous.")
+        up = st.file_uploader(
+            "Historique des indisponibilités (.parquet)",
+            type=["parquet"],
+            help="Export EDF converti en Parquet. Déposé une fois sur R2, "
+                 "il est ensuite lu automatiquement à chaque chargement.",
+        )
+        if up is not None and st.button("☁️ Envoyer vers R2", use_container_width=True):
+            uploader_remit_vers_r2(up.getvalue())
+            st.toast("☁️ Fichier REMIT enregistré sur R2", icon="✅")
+            st.rerun()
+
+    st.markdown("---")
+    info = stats_r2()
+    if info["n"] == 0:
+        st.caption("☁️ Cache R2 vide — premier lancement.")
+    else:
+        st.caption(
+            f"☁️ Cache Cloudflare R2 : **{info['n']} jours**\n\n"
+            f"Du {info['min']} au {info['max']}"
+        )
+    st.markdown(
+        "**Source Pnom** : IAEA PRIS · "
+        "[pris.iaea.org](https://pris.iaea.org/pris/CountryStatistics/"
+        "CountryDetails.aspx?current=FR)"
+    )
+
+# ── Chargement automatique au premier affichage ───────────────────
+if "premier_chargement" not in st.session_state:
+    st.session_state.premier_chargement = True
+    lancer = True
+
+if start_date > end_date:
+    st.error("La date de début doit être antérieure à la date de fin.")
+    st.stop()
+
+# ══════════════════════════════════════════════════════════════════
+# 5. CHARGEMENT
+# ══════════════════════════════════════════════════════════════════
+
+def charger_periode(
+    start: date, end: date, max_workers: int
+) -> tuple[pd.DataFrame, int, int, dict[date, pd.DataFrame]]:
+    """Télécharge les données manquantes et construit le DataFrame pour l'affichage.
+
+    Retourne (df_combined, nb_cache, nb_api, nouveaux_jours) :
+    - df_combined   : données complètes pour la période (cache R2 + nouvelles)
+    - nb_cache      : jours servis depuis le cache R2
+    - nb_api        : jours téléchargés depuis ENTSO-E
+    - nouveaux_jours: dict {jour: df} à sauvegarder sur R2 APRÈS l'affichage.
+                      Aucune écriture R2 n'a lieu pendant cette fonction.
+    """
+    tous_les_jours = [start + timedelta(days=i) for i in range((end - start).days + 1)]
+
+    # Vérification cache — algorithme deux-pointeurs O(n+m)
+    jours_info = jours_cache_dict(start, end)
+    today = datetime.now().date()
+
+    def _est_cache(j: date) -> bool:
+        if j >= today:
+            return False
+        return jours_info.get(j) is not None
+
+    jours_a_fetcher = [j for j in tous_les_jours if not _est_cache(j)]
+    nb_cache        = len(tous_les_jours) - len(jours_a_fetcher)
+    echecs: list[tuple[str, str]] = []
+    nb_ok  = 0
+    nouveaux_jours: dict[date, pd.DataFrame] = {}   # collecte en mémoire, pas de R2 ici
+
+    if jours_a_fetcher:
+        blocs  = list(_chunks(jours_a_fetcher, BLOC_JOURS))
+        client = get_entsoe_client()
+
+        barre   = st.progress(0.0, text="⚡ Téléchargement des jours manquants…")
+        lock    = threading.Lock()
+        counter = {"blocs": 0}
+
+        def _fetch_bloc(bloc: list[date]) -> dict[date, pd.DataFrame | None]:
+            return api_telecharger_bloc(bloc, client)
+
+        def _process_resultats(
+            resultats: dict[date, pd.DataFrame | None], bloc: list[date]
+        ) -> None:
+            nonlocal nb_ok
+            batch = {j: df for j, df in resultats.items() if df is not None}
+            fails = [j for j, df in resultats.items() if df is None]
+            # Accumuler en mémoire — AUCUNE écriture R2 ici
+            nouveaux_jours.update(batch)
+            nb_ok += len(batch)
+            for j in fails:
+                echecs.append((str(j), "Aucune donnée retournée par l'API"))
+            with lock:
+                counter["blocs"] += 1
+                pct  = counter["blocs"] / len(blocs)
+                done = counter["blocs"] * BLOC_JOURS
+                barre.progress(
+                    pct,
+                    text=f"⚡ ~{min(done, len(jours_a_fetcher))}/{len(jours_a_fetcher)} jours traités…",
+                )
+
+        if len(blocs) == 1:
+            resultats = _fetch_bloc(blocs[0])
+            _process_resultats(resultats, blocs[0])
+        else:
+            with ThreadPoolExecutor(max_workers=max_workers) as ex:
+                futures = {ex.submit(_fetch_bloc, bloc): bloc for bloc in blocs}
+                try:
+                    for fut in as_completed(futures, timeout=300):
+                        try:
+                            _process_resultats(fut.result(timeout=120), futures[fut])
+                        except Exception as exc:
+                            bloc = futures[fut]
+                            echecs.extend([(str(j), str(exc)) for j in bloc])
+                            with lock:
+                                counter["blocs"] += 1
+                                barre.progress(counter["blocs"] / len(blocs))
+                except Exception:
+                    for fut in futures:
+                        fut.cancel()
+                    echecs += [
+                        (str(j), "Timeout — ENTSO-E n'a pas répondu")
+                        for fut in futures if not fut.done()
+                        for j in futures[fut]
+                    ]
+
+        barre.empty()
+        if echecs:
+            with st.expander(f"⚠️ {len(echecs)} jour(s) en erreur"):
+                for j, err in echecs:
+                    st.write(f"**{j}** : {err}")
+
+    # ── Construire le DataFrame complet : cache R2 + nouvelles données ──
+    # On fusionne ici EN MÉMOIRE ; aucun upload R2 n'a encore eu lieu.
+    df_cache = charger_depuis_parquet_cache(start, end)
+
+    if nouveaux_jours:
+        dfs_new = []
+        for jour, df_j in nouveaux_jours.items():
+            if df_j is None or df_j.empty:
+                continue
+            idx = df_j.index
+            if idx.tz is None:
+                idx = idx.tz_localize("UTC")
+            df_j = df_j.copy()
+            df_j.index   = idx.tz_convert(TZ)
+            df_j.columns = [str(c) for c in df_j.columns]
+            df_j = _dedup_columns(df_j)
+            borne_s = pd.Timestamp(str(jour) + " 00:00", tz=TZ)
+            borne_e = pd.Timestamp(str(jour) + " 23:59:59", tz=TZ)
+            mask = (df_j.index >= borne_s) & (df_j.index <= borne_e)
+            dfs_new.append(df_j.loc[mask])
+
+        if dfs_new:
+            df_new_all = pd.concat(dfs_new, axis=0)
+            df_new_all = df_new_all[~df_new_all.index.duplicated(keep="last")]
+            if not df_cache.empty:
+                df = pd.concat([df_cache, df_new_all], axis=0, join="outer")
+                df = df[~df.index.duplicated(keep="last")]
+                df = df.sort_index()
+                df = _dedup_columns(df)
+            else:
+                df = df_new_all.sort_index()
+        else:
+            df = df_cache
+    else:
+        df = df_cache
+
+    return df, nb_cache, nb_ok, nouveaux_jours
+
+
+if lancer:
+    # ── Chargement frais depuis ENTSO-E + cache R2 ────────────────
+    if start_date > end_date:
+        st.error("La date de début doit être antérieure à la date de fin.")
+        st.stop()
+
+    with st.spinner("⏳ Chargement des données…"):
+        try:
+            df_brut, nb_cache, nb_api, nouveaux_jours = charger_periode(
+                start_date, end_date, MAX_WORKERS_API
+            )
+        except Exception as exc:
+            st.error(f"Erreur : {exc}")
+            st.stop()
+
+    if df_brut is None or df_brut.empty:
+        st.error("Aucune donnée disponible pour cette période.")
+        st.stop()
+
+    # Persister en session_state → permet de réafficher sans recharger
+    _buf = io.BytesIO()
+    df_brut.to_parquet(_buf)
+    st.session_state.last_render = {
+        "df_bytes"  : _buf.getvalue(),
+        "start"     : start_date,
+        "end"       : end_date,
+        "nb_cache"  : nb_cache,
+        "nb_api"    : nb_api,
+    }
+
+elif st.session_state.last_render is not None:
+    # ── Réaffichage sans rechargement (ex : changement de dates) ──
+    # On restaure les dernières données chargées. L'utilisateur voit les
+    # graphiques précédents et peut cliquer Rafraîchir pour la nouvelle période.
+    _lr        = st.session_state.last_render
+    df_brut    = pd.read_parquet(io.BytesIO(_lr["df_bytes"]))
+    start_date = _lr["start"]
+    end_date   = _lr["end"]
+    nb_jours   = (end_date - start_date).days + 1
+    nb_cache   = _lr["nb_cache"]
+    nb_api     = _lr["nb_api"]
+    nouveaux_jours = {}   # rien à sauvegarder
+
+else:
+    # ── Premier affichage (auto-load en cours, ne devrait pas arriver) ─
+    st.info("📅 Sélectionnez une période et cliquez sur **Rafraîchir**.")
+    st.stop()
+
+st.success(
+    f"✅ Données chargées — {start_date} → {end_date} · "
+    f"☁️ {nb_cache} jour(s) depuis le cache R2 · "
+    f"🌐 {nb_api} jour(s) téléchargé(s) depuis l'API"
+)
+
+# ══════════════════════════════════════════════════════════════════
+# 6. TRAITEMENT
+# ══════════════════════════════════════════════════════════════════
+
+df_nuc = extraire_actual_aggregated(df_brut)
+df_nuc = df_nuc.dropna(axis=1, how="all")
+df_nuc = _dedup_columns(df_nuc)   # efficient boolean-mask max, pas de transpose
+
+if nb_jours > 60:
+    freq = "3h"
+elif nb_jours > 31:
+    freq = "2h"
+else:
+    freq = "1h"
+
+df_nuc = df_nuc.resample(freq).mean().ffill().fillna(0)
+df_nuc = df_nuc[sorted(df_nuc.columns)]
+
+if df_nuc.empty or df_nuc.shape[1] == 0:
+    st.error("Aucune donnée disponible après traitement.")
+    with st.expander("Debug"):
+        st.write(list(df_brut.columns)[:20])
+    st.stop()
+
+reacteurs     = df_nuc.columns.tolist()
+n_total       = len(reacteurs)
+serie_pnom    = pd.Series(
+    {r: PUISSANCE_NOMINALE_MW.get(r, max(df_nuc[r].max(), 900.0)) for r in reacteurs}
+)
+df_taux       = (df_nuc.div(serie_pnom) * 100).clip(upper=105)
+taux_derniere = df_taux.iloc[-1]
+prod_derniere = df_nuc.iloc[-1]
+reacteurs_on  = int((taux_derniere >= SEUIL_ON_PCT).sum())
+reacteurs_off = int((taux_derniere < SEUIL_ON_PCT).sum())
+taux_moyen    = taux_derniere[taux_derniere >= SEUIL_ON_PCT].mean()
+
+# ══════════════════════════════════════════════════════════════════
+# 7. GRAPHIQUE — RÉACTEURS EN MARCHE / ARRÊTÉS
+# ══════════════════════════════════════════════════════════════════
+
+st.subheader("⚙️ Réacteurs en marche et à l'arrêt")
+st.caption(
+    f"🟢 Zone verte = en marche · 🔴 Zone rouge = arrêtés · "
+    f"Parc total : {n_total} réacteurs"
+)
+
+en_marche_ts = (df_taux >= SEUIL_ON_PCT).sum(axis=1)
+arretes_ts   = n_total - en_marche_ts
+
+fig_rcount = go.Figure()
+
+# Zone verte : réacteurs en marche (fill from 0 to en_marche curve)
+fig_rcount.add_trace(go.Scatter(
+    x=en_marche_ts.index,
+    y=en_marche_ts.values,
+    name="En marche",
+    mode="lines",
+    fill="tozeroy",
+    fillcolor="rgba(0,200,83,0.22)",
+    line=dict(color="#00C853", width=2),
+    hovertemplate="<b>✅ En marche</b> : %{y:.0f}<extra></extra>",
+))
+
+# Ligne de référence du parc total (barre en haut) + zone rouge
+# y = n_total (constant) avec fill="tonexty" → remplit entre la courbe verte et ce plafond
+fig_rcount.add_trace(go.Scatter(
+    x=en_marche_ts.index,
+    y=[n_total] * len(en_marche_ts),
+    name="Arrêtés",
+    mode="lines",
+    fill="tonexty",                              # remplit depuis en_marche_ts jusqu'à n_total
+    fillcolor="rgba(229,57,53,0.20)",
+    line=dict(color="rgba(200,200,200,0.5)", width=1.2, dash="dot"),
+    customdata=arretes_ts.values,
+    hovertemplate="<b>🔴 Arrêtés</b> : %{customdata:.0f}<extra></extra>",
+))
+
+fig_rcount.update_layout(
+    hovermode="x unified",          # tooltip unique qui affiche les deux valeurs
+    template="plotly_dark",
+    height=200,
+    margin=dict(l=60, r=30, t=20, b=30),
+    yaxis=dict(
+        title="Nb réacteurs",
+        range=[0, n_total + 4],
+        dtick=10,
+        gridcolor="rgba(180,180,180,0.15)",
+        tickfont=dict(size=11),
+    ),
+    xaxis=dict(showgrid=False),
+    legend=dict(
+        orientation="h",
+        yanchor="bottom", y=1.02,
+        xanchor="right",  x=1,
+        font=dict(size=11),
+    ),
+)
+
+st.plotly_chart(fig_rcount, use_container_width=True, theme=None)
+
+# ══════════════════════════════════════════════════════════════════
+# 7bis. INDISPONIBILITÉS REMIT PAR CATÉGORIE
+# ══════════════════════════════════════════════════════════════════
+
+st.subheader("🗂️ Indisponibilités déclarées par catégorie (REMIT EDF)")
+st.caption(
+    "Nombre de réacteurs concernés par une déclaration active à chaque instant · "
+    "🔴 Fortuit · 🟠 Planifié · 🟡 PMIN · 🔵 aFRR · 🟢 Chronique simple"
+)
+
+remit = charger_remit()
+
+if remit.empty:
+    st.info(
+        "📥 Aucune donnée REMIT chargée. Déposez l'export EDF (.parquet) via "
+        "**la sidebar → 📥 Données REMIT** pour activer ce graphique."
+    )
+else:
+    # Axe de temps = celui de la production (résolution adaptive déjà appliquée)
+    df_remit_counts = compter_indispo_par_categorie(remit, df_nuc.index)
+
+    fig_remit = go.Figure()
+    for cat in REMIT_PRIORITE:
+        libelle, couleur, _types = REMIT_CATEGORIES[cat]
+        fig_remit.add_trace(go.Scatter(
+            x=df_remit_counts.index,
+            y=df_remit_counts[libelle].values,
+            name=libelle,
+            mode="lines",
+            stackgroup="remit",            # empilement des catégories
+            line=dict(width=0.5, color=couleur),
+            fillcolor=couleur,
+            hovertemplate=f"<b>{libelle}</b> : " + "%{y} réacteurs<extra></extra>",
+        ))
+
+    fig_remit.update_layout(
+        hovermode="x unified",
+        template="plotly_dark",
+        height=340,
+        margin=dict(l=60, r=30, t=20, b=30),
+        yaxis=dict(
+            title="Nb réacteurs",
+            gridcolor="rgba(180,180,180,0.15)",
+            tickfont=dict(size=11),
+        ),
+        xaxis=dict(showgrid=False),
+        legend=dict(
+            orientation="h",
+            yanchor="bottom", y=1.02,
+            xanchor="right",  x=1,
+            font=dict(size=11),
+        ),
+    )
+    st.plotly_chart(fig_remit, use_container_width=True, theme=None)
+
+    with st.expander("ℹ️ Comment lire ce graphique"):
+        st.markdown(
+            "- Chaque réacteur est compté **une seule fois** par instant, dans sa "
+            "catégorie la plus prioritaire (fortuit > planifié > PMIN > aFRR > "
+            "chronique simple), afin d'éviter le double comptage quand plusieurs "
+            "déclarations se chevauchent.\n"
+            "- **Arrêt fortuit** : indisponibilité non programmée (défaillance).\n"
+            "- **Arrêt planifié** : maintenance / rechargement programmés.\n"
+            "- **Chronique PMIN** : réacteur contraint à son plancher technique.\n"
+            "- **Chronique aFRR** : réacteur en retrait pour fournir la réserve "
+            "secondaire de fréquence.\n"
+            "- **Chronique simple** : autre modulation programmée."
+        )
+
+# ══════════════════════════════════════════════════════════════════
+# 7ter. PUISSANCE RÉELLE / PUISSANCE NOMINALE DU PARC (%)
+# ══════════════════════════════════════════════════════════════════
+
+st.subheader("📉 Taux d'utilisation du parc — Puissance réelle / Pnom totale")
+pnom_totale = float(serie_pnom.sum())
+st.caption(
+    f"Somme de la production réelle rapportée à la puissance nominale installée "
+    f"du parc ({pnom_totale / 1e3:.1f} GW)"
+)
+
+# Production totale du parc à chaque instant / Pnom totale → %
+prod_totale_ts = df_nuc.sum(axis=1)
+taux_parc_ts   = (prod_totale_ts / pnom_totale * 100).clip(upper=105)
+
+fig_parc = go.Figure()
+fig_parc.add_trace(go.Scatter(
+    x=taux_parc_ts.index,
+    y=taux_parc_ts.values,
+    mode="lines",
+    line=dict(color="#00C853", width=2),
+    fill="tozeroy",
+    fillcolor="rgba(0,200,83,0.15)",
+    name="Taux d'utilisation",
+    hovertemplate="%{x}<br><b>%{y:.1f} %</b> de la Pnom parc<extra></extra>",
+))
+# Ligne moyenne de la période
+moyenne_parc = float(taux_parc_ts.mean())
+fig_parc.add_hline(
+    y=moyenne_parc,
+    line=dict(color="#FDD835", width=1, dash="dash"),
+    annotation_text=f"Moyenne : {moyenne_parc:.1f} %",
+    annotation_position="top left",
+    annotation_font_color="#FDD835",
+)
+fig_parc.update_layout(
+    template="plotly_dark",
+    height=300,
+    margin=dict(l=60, r=30, t=20, b=30),
+    yaxis=dict(
+        title="% Pnom parc",
+        ticksuffix=" %",
+        range=[0, 105],
+        gridcolor="rgba(180,180,180,0.15)",
+        tickfont=dict(size=11),
+    ),
+    xaxis=dict(showgrid=False),
+)
+st.plotly_chart(fig_parc, use_container_width=True, theme=None)
+
+# ══════════════════════════════════════════════════════════════════
+# 8. MÉTRIQUES
+# ══════════════════════════════════════════════════════════════════
+
+st.markdown("---")
+c1, c2, c3, c4, c5 = st.columns(5)
+c1.metric("☢️ Production totale",       f"{prod_derniere.sum():,.0f} MW")
+c2.metric("✅ En marche",               f"{reacteurs_on} réacteurs")
+c3.metric("🔴 Arrêtés / < 5 %",        f"{reacteurs_off} réacteurs")
+c4.metric("📊 Taux de charge moyen",   f"{taux_moyen:.1f} %")
+c5.metric("⚡ Puissance nominale parc", f"{serie_pnom.sum() / 1e3:.1f} GW")
+st.markdown("---")
+
+# ══════════════════════════════════════════════════════════════════
+# 9. HEATMAP
+# ══════════════════════════════════════════════════════════════════
+
+st.subheader("🔲 Heatmap — Taux de charge par réacteur (% Pnom)")
+st.caption("🟢 Vert = puissance nominale · ⚫ Noir = arrêt · 🟡 intermédiaire = modulation")
+
+COLORSCALE = [
+    [0.00, "rgb(5,5,5)"],     [0.04, "rgb(40,5,5)"],
+    [0.15, "rgb(120,20,0)"],  [0.30, "rgb(180,60,0)"],
+    [0.45, "rgb(200,120,0)"], [0.60, "rgb(210,190,0)"],
+    [0.75, "rgb(170,210,30)"], [0.88, "rgb(80,200,40)"],
+    [0.95, "rgb(30,220,60)"],  [0.99, "rgb(10,230,70)"],
+    [1.00, "rgb(0,255,80)"],
+]
+
+df_plot_heat = df_taux.resample("2h").mean() if nb_jours > 31 else df_taux
+
+fig_heatmap = go.Figure(go.Heatmap(
+    z=df_plot_heat[reacteurs].T.values,
+    x=df_plot_heat.index,
+    y=reacteurs,
+    colorscale=COLORSCALE, zmin=0, zmax=100, hoverongaps=False,
+    hovertemplate="%{y}<br>%{x}<br>%{z:.1f} % Pnom<extra></extra>",
+    colorbar=dict(
+        title="% Pnom", ticksuffix=" %",
+        tickvals=[0, 25, 50, 75, 100], tickfont=dict(size=10),
+    ),
+))
+fig_heatmap.update_layout(
+    xaxis_title="",
+    yaxis=dict(tickfont=dict(size=10), autorange="reversed"),
+    template="plotly_dark",
+    height=max(420, len(reacteurs) * 14),
+    margin=dict(l=140, r=90, t=20, b=40),
+)
+st.plotly_chart(fig_heatmap, use_container_width=True, theme=None)
+
+# ══════════════════════════════════════════════════════════════════
+# 10. SPARKLINES
+# ══════════════════════════════════════════════════════════════════
+
+st.subheader("📈 Courbes individuelles — Taux de charge par réacteur")
+st.caption("🟢 Vert = en marche · 🔴 Rouge = arrêté · Axe Y = % Pnom (IAEA PRIS)")
+
+df_plot_spark = df_taux.resample("2h").mean() if nb_jours > 31 else df_taux
+
+n_rows_spark = max(1, math.ceil(len(reacteurs) / N_COLS_SPARKLINES))
+titres       = [f"{r}<br>{serie_pnom[r]:.0f} MW" for r in reacteurs]
+
+fig_spark = make_subplots(
+    rows=n_rows_spark, cols=N_COLS_SPARKLINES,
+    subplot_titles=titres, shared_xaxes=True,
+    vertical_spacing=0.03, horizontal_spacing=0.06,
+)
+
+for idx, reacteur in enumerate(reacteurs):
+    row       = idx // N_COLS_SPARKLINES + 1
+    col       = idx % N_COLS_SPARKLINES + 1
+    serie_pct = df_plot_spark[reacteur]
+    en_marche = serie_pct.iloc[-1] >= SEUIL_ON_PCT
+    couleur   = "#00C853" if en_marche else "#E53935"
+    fill_col  = "rgba(0,200,83,0.15)" if en_marche else "rgba(229,57,53,0.15)"
+    fig_spark.add_trace(go.Scatter(
+        x=serie_pct.index, y=serie_pct.values,
+        mode="lines", line=dict(color=couleur, width=1.2),
+        fill="tozeroy", fillcolor=fill_col,
+        name=reacteur, showlegend=False,
+        hovertemplate="%{x}<br>%{y:.1f} % Pnom<extra>" + reacteur + "</extra>",
+    ), row=row, col=col)
+
+shapes_hline = []
+for idx in range(min(len(reacteurs), MAX_SHAPES)):
+    ax_idx = idx + 1
+    shapes_hline.append(dict(
+        type="line", x0=0, x1=1, y0=100, y1=100,
+        xref="x domain" if ax_idx == 1 else f"x{ax_idx} domain",
+        yref="y"        if ax_idx == 1 else f"y{ax_idx}",
+        line=dict(dash="dot", color="rgba(255,255,255,0.2)", width=0.8),
+    ))
+
+fig_spark.update_layout(
+    template="plotly_dark", height=max(800, n_rows_spark * 200),
+    hovermode="closest", margin=dict(l=30, r=20, t=60, b=20), shapes=shapes_hline,
+)
+fig_spark.update_annotations(font_size=9)
+fig_spark.update_xaxes(showticklabels=False, showspikes=False, showgrid=False)
+fig_spark.update_yaxes(
+    showticklabels=True, ticksuffix="%", nticks=3,
+    tickfont=dict(size=9, color="#CCCCCC"),
+    gridcolor="rgba(180,180,180,0.3)", gridwidth=0.5,
+    showgrid=True, zeroline=False, rangemode="tozero", showspikes=False,
+)
+st.plotly_chart(fig_spark, use_container_width=True, theme=None)
+
+# ══════════════════════════════════════════════════════════════════
+# 11. TABLEAU & TÉLÉCHARGEMENT
+# ══════════════════════════════════════════════════════════════════
+
+# ── Générateurs de fichiers (mis en cache : régénérés seulement si les
+#    données changent, pour ne pas ralentir chaque rerun Streamlit) ─────
+def _prod_to_excel_bytes(df: pd.DataFrame) -> bytes:
+    """DataFrame production (MW) → .xlsx : index sans timezone, inf nettoyés."""
+    out = df.copy()
+    # Colonnes dupliquées éventuelles (patch ENTSO-E) -> fusion max
+    if out.columns.duplicated().any():
+        out = _dedup_columns(out)
+    # Aplatir un éventuel MultiIndex de colonnes (sinon en-têtes illisibles)
+    if isinstance(out.columns, pd.MultiIndex):
+        out.columns = [" / ".join(str(x) for x in tup) for tup in out.columns]
+    if getattr(out.index, "tz", None) is not None:
+        out.index = out.index.tz_convert(TZ).tz_localize(None)
+    out.index.name = "timestamp (heure Paris)"
+    # Retirer le fuseau d'éventuelles colonnes datetime tz-aware
+    for c in out.select_dtypes(include=["datetimetz"]).columns:
+        out[c] = out[c].dt.tz_localize(None)
+    out = out.replace([float("inf"), float("-inf")], pd.NA)
+    buf = io.BytesIO()
+    out.to_excel(buf, engine="openpyxl", sheet_name="Production (MW)")
+    return buf.getvalue()
+
+
+def _prod_to_parquet_bytes(df: pd.DataFrame) -> bytes:
+    buf = io.BytesIO()
+    df.to_parquet(buf)
+    return buf.getvalue()
+
+
+with st.expander("📋 Tableau — taux de charge par réacteur (dernière valeur)"):
+    df_table = pd.DataFrame({
+        "Pnom (MWe)"          : serie_pnom,
+        "Production (MW)"     : prod_derniere.round(0),
+        "Taux de charge (%)": taux_derniere.round(1),
+        "État"                : taux_derniere.apply(
+            lambda x: "✅ En marche" if x >= SEUIL_ON_PCT else "🔴 Arrêté"
+        ),
+    }).sort_values("Taux de charge (%)", ascending=False)
+    st.dataframe(df_table, use_container_width=True)
+
+with st.expander("💾 Télécharger les données source (production par réacteur, MW)"):
+    try:
+        df_source_full = _charger_parquet_complet_cached()
+
+        if df_source_full is None or df_source_full.empty:
+            st.caption("Aucune donnée source disponible dans le cache R2.")
+        else:
+            try:
+                _n_jours_dl = df_source_full.index.normalize().nunique()
+            except Exception:
+                _n_jours_dl = "?"
+            st.caption(
+                f"Base source : {df_source_full.shape[1]} réacteurs · "
+                f"{df_source_full.shape[0]:,} lignes · {_n_jours_dl} jours téléchargés"
+            )
+
+            # NOTE : data=callable (Streamlit ≥ 1.52) → le fichier n'est
+            # généré QUE lorsque l'utilisateur clique, jamais au chargement
+            # de la page. Indispensable ici : générer l'Excel de toute la
+            # base à chaque rerun saturait la mémoire de Streamlit Cloud.
+
+            # ── 1 & 2 : toute la base (tous les jours téléchargés) ────────
+            col_dl1, col_dl2 = st.columns(2)
+            with col_dl1:
+                st.download_button(
+                    "⬇️ Parquet — tous les jours téléchargés",
+                    data=lambda df=df_source_full: _prod_to_parquet_bytes(df),
+                    file_name="nucleaire_production_FR.parquet",
+                    mime="application/octet-stream",
+                    use_container_width=True,
+                    help="Données source brutes (production MW). Recommandé pour Python/Pandas.",
+                )
+                st.caption("⚡ Rapide · Pour Python")
+            with col_dl2:
+                st.download_button(
+                    "⬇️ Excel — tous les jours téléchargés",
+                    data=lambda df=df_source_full: _prod_to_excel_bytes(df),
+                    file_name="nucleaire_production_FR.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    use_container_width=True,
+                    help="Toute la base source au format Excel. La génération se "
+                         "lance au clic et peut prendre quelques secondes.",
+                )
+                st.caption("📊 Excel · Tous les jours")
+
+            # ── 3 : période sélectionnée uniquement ──────────────────────
+            st.markdown("---")
+            df_source_periode = charger_depuis_parquet_cache(start_date, end_date)
+            col_dl3, col_dl4 = st.columns(2)
+            with col_dl3:
+                if df_source_periode is None or df_source_periode.empty:
+                    st.button(
+                        "⬇️ Excel — période sélectionnée",
+                        disabled=True, use_container_width=True,
+                        help="Aucune donnée source pour cette période.",
+                    )
+                else:
+                    st.download_button(
+                        "⬇️ Excel — période sélectionnée",
+                        data=lambda df=df_source_periode: _prod_to_excel_bytes(df),
+                        file_name=f"nucleaire_production_FR_{start_date}_{end_date}.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        use_container_width=True,
+                        help=f"Production source du {start_date} au {end_date}.",
+                    )
+            with col_dl4:
+                _n_reac = (df_source_periode.shape[1]
+                           if df_source_periode is not None
+                           and not df_source_periode.empty else 0)
+                st.caption(
+                    f"Période : {start_date:%d/%m/%Y} → {end_date:%d/%m/%Y}\n\n"
+                    f"Réacteurs : {_n_reac}"
+                )
+    except Exception as _e_dl:
+        # Filet de sécurité : une erreur ici ne doit jamais tuer le dashboard.
+        st.warning(f"⚠️ Section téléchargement indisponible : {type(_e_dl).__name__} — {_e_dl}")
+
+# ══════════════════════════════════════════════════════════════════
+# 12. SAUVEGARDE R2 — APRÈS L'AFFICHAGE
+# ══════════════════════════════════════════════════════════════════
+# Les graphiques sont déjà rendus. On enregistre maintenant les nouvelles
+# données sur Cloudflare R2 en un seul bloc atomique (download→merge→upload).
+
+if nouveaux_jours:
+    with st.spinner("💾 Sauvegarde vers Cloudflare R2…"):
+        # _charger_parquet_complet_cached() est déjà en mémoire (téléchargé plus haut) :
+        # on le passe en argument pour éviter un 2ème aller-retour R2.
+        sauvegarder_batch_en_r2(
+            nouveaux_jours,
+            df_existing=_charger_parquet_complet_cached(),
+        )
+    st.toast(
+        f"☁️ Cache R2 mis à jour — {len(nouveaux_jours)} jour(s) enregistrés",
+        icon="✅",
+    )
