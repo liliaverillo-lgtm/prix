@@ -1,26 +1,24 @@
-"""
-dashboard_prix_dayahead.py
+""" dashboard_prix_dayahead.py
 ───────────────────────────
 Dashboard Streamlit — Prix Day-Ahead ENTSO-E
 Même architecture que le dashboard nucléaire :
-  • Données persistées sur Cloudflare R2 (master_db.parquet)
-  • Au démarrage : chargement depuis R2 vers /tmp/
-  • Données manquantes pour la sélection → auto-fetch ENTSO-E → sauvegarde R2
-  • Upload fichier Parquet → fusion dans R2
+• Données persistées sur Cloudflare R2 (master_db.parquet)
+• Au démarrage : chargement depuis R2 vers /tmp/
+• Données manquantes pour la sélection → auto-fetch ENTSO-E → sauvegarde R2
+• Upload fichier Parquet → fusion dans R2
 
 Secrets requis (.streamlit/secrets.toml) :
-    ENTSOE_TOKEN = "..."
-    [r2]
-    account_id        = "..."
-    access_key_id     = "..."
-    secret_access_key = "..."
-    bucket_name       = "..."
+ENTSOE_TOKEN = "..."
+[r2]
+account_id = "..."
+access_key_id = "..."
+secret_access_key = "..."
+bucket_name = "..."
 
 Lancer :
-    pip install streamlit entsoe-py plotly pandas pyarrow boto3
-    streamlit run dashboard_prix_dayahead.py
+pip install streamlit entsoe-py plotly pandas pyarrow boto3
+streamlit run dashboard_prix_dayahead.py
 """
-
 import io
 import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -32,15 +30,15 @@ import plotly.graph_objects as go
 import streamlit as st
 from botocore.exceptions import ClientError
 
-# ── Config page ────────────────────────────────────────────────────────────────
+# ── Config page ───────────────────────────────────────────────────────────────
 st.set_page_config(
     page_title="Prix Day-Ahead — ENTSO-E",
     page_icon="⚡",
     layout="wide",
 )
 
-# ── Constantes ─────────────────────────────────────────────────────────────────
-R2_KEY   = "prix_dayahead/master_db.parquet"
+# ── Constantes ────────────────────────────────────────────────────────────────
+R2_KEY    = "prix_dayahead/master_db.parquet"
 LOCAL_TMP = "/tmp/master_db_prix.parquet"
 
 PAYS = {
@@ -68,31 +66,27 @@ PALETTE = [
     "#8B5CF6", "#EF4444", "#10B981", "#F59E0B", "#3B82F6",
 ]
 
-
 # ══════════════════════════════════════════════════════════════════════════════
-#  CLIENT R2
+# CLIENT R2
 # ══════════════════════════════════════════════════════════════════════════════
-
 @st.cache_resource
 def get_r2_client():
     """Client boto3 pour Cloudflare R2 — partagé entre les sessions."""
     r2 = st.secrets["r2"]
     return boto3.client(
         "s3",
-        endpoint_url          = f"https://{r2['account_id']}.r2.cloudflarestorage.com",
-        aws_access_key_id     = r2["access_key_id"],
+        endpoint_url        = f"https://{r2['account_id']}.r2.cloudflarestorage.com",
+        aws_access_key_id   = r2["access_key_id"],
         aws_secret_access_key = r2["secret_access_key"],
-        region_name           = "auto",
+        region_name         = "auto",
     )
 
 def r2_bucket() -> str:
     return st.secrets["r2"]["bucket_name"]
 
-
 # ══════════════════════════════════════════════════════════════════════════════
-#  BASE DE DONNÉES (R2 ↔ /tmp/)
+# BASE DE DONNÉES (R2 ↔ /tmp/)
 # ══════════════════════════════════════════════════════════════════════════════
-
 def load_db() -> pd.DataFrame:
     """
     Charge la base depuis R2.
@@ -115,13 +109,11 @@ def load_db() -> pd.DataFrame:
             return pd.DataFrame()
         raise
 
-
 def save_db(df: pd.DataFrame):
     """Sauvegarde /tmp/ + upload vers R2."""
     df.to_parquet(LOCAL_TMP)
     s3 = get_r2_client()
     s3.upload_file(LOCAL_TMP, r2_bucket(), R2_KEY)
-
 
 def merge_into_db(new_df: pd.DataFrame) -> pd.DataFrame:
     """Fusionne new_df dans la base R2. new_df est prioritaire."""
@@ -134,7 +126,6 @@ def merge_into_db(new_df: pd.DataFrame) -> pd.DataFrame:
     save_db(merged)
     return merged
 
-
 def db_info(df: pd.DataFrame) -> str:
     if df.empty:
         return "Base vide"
@@ -142,25 +133,17 @@ def db_info(df: pd.DataFrame) -> str:
             f"{df.index.min().strftime('%d/%m/%Y')} → "
             f"{df.index.max().strftime('%d/%m/%Y')}")
 
-
-def pays_manquants_pour_periode(db: pd.DataFrame,
-                                 pays_list: list,
-                                 start: date,
-                                 end: date) -> list:
+def pays_manquants_pour_periode(db: pd.DataFrame, pays_list: list, start: date, end: date) -> list:
     """
-    Retourne uniquement les pays qui n'ont AUCUNE donnée
-    sur la période demandée.
-    On ne re-fetche pas si des données existent déjà,
-    même partiellement — l'utilisateur peut uploader un fichier
-    plus récent si besoin.
+    Retourne uniquement les pays qui n'ont AUCUNE donnée sur la période demandée.
+    On ne re-fetche pas si des données existent déjà, même partiellement —
+    l'utilisateur peut uploader un fichier plus récent si besoin.
     """
     if db.empty:
         return pays_list
-
     manquants = []
     ts_start = pd.Timestamp(start.isoformat(), tz="UTC")
     ts_end   = pd.Timestamp(end.isoformat(),   tz="UTC") + pd.Timedelta(days=1)
-
     for pays in pays_list:
         if pays not in db.columns:
             manquants.append(pays)
@@ -169,32 +152,25 @@ def pays_manquants_pour_periode(db: pd.DataFrame,
         sr = db.loc[ts_start:ts_end, pays].dropna()
         if len(sr) == 0:
             manquants.append(pays)
-
     return manquants
 
-
 # ══════════════════════════════════════════════════════════════════════════════
-#  FETCH API ENTSO-E
+# FETCH API ENTSO-E
 # ══════════════════════════════════════════════════════════════════════════════
-
 @st.cache_resource
 def get_entsoe_client():
     from entsoe import EntsoePandasClient
     return EntsoePandasClient(api_key=st.secrets["ENTSOE_TOKEN"])
 
-
 def fetch_pays(pays_list: list, start: date, end: date) -> int:
     """
-    Télécharge les pays manquants en parallèle depuis ENTSO-E
-    et les fusionne dans R2.
+    Télécharge les pays manquants en parallèle depuis ENTSO-E et les fusionne dans R2.
     Retourne le nombre de pays récupérés avec succès.
     """
     from entsoe.exceptions import NoMatchingDataError
-
     ts_start = pd.Timestamp(start.isoformat(), tz="Europe/Paris")
     ts_end   = pd.Timestamp(end.isoformat(),   tz="Europe/Paris") + pd.Timedelta(days=1)
-
-    results = {}
+    results  = {}
 
     def _fetch_one(nom):
         code = NOM_TO_CODE.get(nom)
@@ -220,31 +196,55 @@ def fetch_pays(pays_list: list, start: date, end: date) -> int:
         df_new = pd.DataFrame(results)
         df_new.index = pd.to_datetime(df_new.index, utc=True)
         merge_into_db(df_new)
-
     return len(results)
 
-
 # ══════════════════════════════════════════════════════════════════════════════
-#  RÉSOLUTION
+# RÉSOLUTION
 # ══════════════════════════════════════════════════════════════════════════════
-
 def resample(df: pd.DataFrame, freq: str) -> pd.DataFrame:
-    if freq == "Horaire":      return df
-    if freq == "Journalier":   return df.resample("1D").mean()
+    if freq == "Horaire":     return df
+    if freq == "Journalier":  return df.resample("1D").mean()
     if freq == "Hebdomadaire": return df.resample("1W").mean()
-    if freq == "Mensuel":      return df.resample("1ME").mean()
+    if freq == "Mensuel":     return df.resample("1ME").mean()
     return df
 
+# ══════════════════════════════════════════════════════════════════════════════
+# UTILITAIRE : comptage d'heures à prix négatif (robuste au pas 15 min)
+# ══════════════════════════════════════════════════════════════════════════════
+def heures_negatives(sr: pd.Series) -> float:
+    """
+    Compte le nombre d'heures à prix nul ou négatif dans une série temporelle,
+    quelle que soit la granularité (horaire ou quart-horaire).
+
+    Méthode :
+    - On compte d'abord le nombre de pas de temps (15 min ou 1 h) négatifs.
+    - On détecte la fréquence réelle de la série via l'écart médian entre timestamps.
+    - Si l'écart médian est ≤ 15 min → données en quart d'heure → on divise par 4.
+    - Sinon → données horaires → pas de division.
+    """
+    sr = sr.dropna()
+    if len(sr) == 0:
+        return 0.0
+
+    nb_pas_negatifs = int((sr <= 0).sum())
+
+    # Détection de la granularité via l'écart médian entre timestamps
+    if len(sr) >= 2:
+        diffs = sr.index.to_series().diff().dropna()
+        ecart_median = diffs.median()
+        if ecart_median <= pd.Timedelta(minutes=15):
+            return nb_pas_negatifs / 4.0
+
+    return float(nb_pas_negatifs)
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  SIDEBAR
+# SIDEBAR
 # ══════════════════════════════════════════════════════════════════════════════
-
 with st.sidebar:
     st.markdown("## ⚡ Prix Day-Ahead")
     st.markdown("---")
 
-    # ── Dates ──────────────────────────────────────────────────────────────────
+    # ── Dates ─────────────────────────────────────────────────────────────────
     st.markdown("### 📅 Période")
     col1, col2 = st.columns(2)
     with col1:
@@ -265,19 +265,17 @@ with st.sidebar:
         st.error("La date de début doit être avant la date de fin.")
         st.stop()
 
-    # ── Résolution ─────────────────────────────────────────────────────────────
+    # ── Résolution ────────────────────────────────────────────────────────────
     st.markdown("### 📊 Résolution")
     resolution = st.selectbox(
         "Agréger par",
         ["Horaire", "Journalier", "Hebdomadaire", "Mensuel"],
         index=1,
     )
-
     st.markdown("---")
 
-    # ── Sélection pays ─────────────────────────────────────────────────────────
+    # ── Sélection pays ────────────────────────────────────────────────────────
     st.markdown("### 🌍 Pays")
-
     col_a, col_b = st.columns(2)
     with col_a:
         if st.button("Tout cocher", use_container_width=True):
@@ -291,9 +289,8 @@ with st.sidebar:
 
     db = load_db()
     pays_en_base = set(db.columns.tolist()) if not db.empty else set()
-
     for nom in PAYS.values():
-        badge = "✓" if nom in pays_en_base else "○"
+        badge   = "✓" if nom in pays_en_base else "○"
         checked = st.checkbox(
             f"{badge} {nom}",
             value=st.session_state.selection.get(nom, False),
@@ -302,33 +299,28 @@ with st.sidebar:
         st.session_state.selection[nom] = checked
 
     pays_selectionnes = [p for p, v in st.session_state.selection.items() if v]
-
     st.markdown("---")
-    st.caption(f"✓ = en base R2  ·  ○ = à télécharger\n\n{db_info(db)}")
-
+    st.caption(f"✓ = en base R2 · ○ = à télécharger\n\n{db_info(db)}")
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  AUTO-FETCH des données manquantes
+# AUTO-FETCH des données manquantes
 # ══════════════════════════════════════════════════════════════════════════════
-
 if pays_selectionnes:
     manquants = pays_manquants_pour_periode(db, pays_selectionnes, date_debut, date_fin)
     if manquants:
         with st.spinner(f"Téléchargement depuis ENTSO-E : {', '.join(manquants)}…"):
             n = fetch_pays(manquants, date_debut, date_fin)
             db = load_db()
-        if n > 0:
-            st.success(f"✓ {n} pays téléchargés et sauvegardés dans R2.")
-        else:
-            st.warning("Données non disponibles sur ENTSO-E pour cette sélection.")
-
+            if n > 0:
+                st.success(f"✓ {n} pays téléchargés et sauvegardés dans R2.")
+            else:
+                st.warning("Données non disponibles sur ENTSO-E pour cette sélection.")
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  ZONE PRINCIPALE
+# ZONE PRINCIPALE
 # ══════════════════════════════════════════════════════════════════════════════
-
 st.markdown(
-    "<h1 style='font-size:1.8rem;margin-bottom:0'>⚡ Prix Day-Ahead — ENTSO-E</h1>",
+    "<h1 style='font-size:1.8rem;margin-bottom:0'>⚡ Prix Day-Ahead ENTSO-E</h1>",
     unsafe_allow_html=True,
 )
 st.markdown(
@@ -349,7 +341,6 @@ if db.empty:
 # ── Filtrer par pays disponibles et période ────────────────────────────────────
 pays_dispo   = [p for p in pays_selectionnes if p in db.columns]
 pays_absents = [p for p in pays_selectionnes if p not in db.columns]
-
 if pays_absents:
     st.warning(f"Données non disponibles pour : {', '.join(pays_absents)}")
 if not pays_dispo:
@@ -359,15 +350,14 @@ if not pays_dispo:
 ts_debut = pd.Timestamp(date_debut.isoformat(), tz="UTC")
 ts_fin   = pd.Timestamp(date_fin.isoformat(),   tz="UTC") + pd.Timedelta(days=1)
 df_view  = db.loc[ts_debut:ts_fin, pays_dispo].copy()
-
 if df_view.empty:
     st.warning("Pas de données pour cette période.")
     st.stop()
 
 df_view.index = df_view.index.tz_convert("Europe/Paris")
 
-# df_raw = données horaires brutes (pour les stats et heures négatives)
-# df_view = données rééchantillonnées (pour le graphique uniquement)
+# df_raw  = données brutes (horaires ou quart-horaires) pour les stats
+# df_view = données rééchantillonnées pour le graphique uniquement
 df_raw  = df_view.copy()
 df_view = resample(df_view, resolution)
 
@@ -377,13 +367,9 @@ for nom in pays_dispo:
     idx   = list(PAYS.values()).index(nom) if nom in PAYS.values() else 0
     color = PALETTE[idx % len(PALETTE)]
     fig.add_trace(go.Scatter(
-        x=df_view.index,
-        y=df_view[nom].values,
-        name=nom,
-        line=dict(color=color, width=1.8),
-        mode="lines",
+        x=df_view.index, y=df_view[nom].values,
+        name=nom, line=dict(color=color, width=1.8), mode="lines",
     ))
-
 fig.update_layout(height=520, hovermode="x unified", margin=dict(l=10, r=10, t=30, b=10))
 fig.update_xaxes(rangeslider_visible=True)
 fig.update_yaxes(title_text="€/MWh")
@@ -391,21 +377,47 @@ st.plotly_chart(fig, use_container_width=True)
 
 # ── Statistiques ───────────────────────────────────────────────────────────────
 st.markdown("### 📊 Statistiques")
-# Stats toujours calculées sur les données HORAIRES (df_raw)
-# quelle que soit la résolution d'affichage du graphique
+
 rows = []
 for nom in pays_dispo:
     sr = df_raw[nom].dropna()
     if len(sr) == 0:
         continue
+    h_neg = heures_negatives(sr)
     rows.append({
-        "Pays":             nom,
+        "Pays":           nom,
+        "Moyenne (€/MWh)": round(float(sr.mean()), 1),
+        "Médiane":        round(float(sr.median()), 1),
+        "Min":            round(float(sr.min()), 1),
+        "Max":            round(float(sr.max()), 1),
+        "Heures ≤ 0":     round(h_neg, 1),
+        "% heures ≤ 0":   f"{h_neg / max(len(sr) / _factor(sr), 1) * 100:.1f} %",
+    })
+
+def _factor(sr: pd.Series) -> float:
+    """Retourne 4 si quart-horaire, 1 sinon."""
+    if len(sr) < 2:
+        return 1.0
+    diffs = sr.dropna().index.to_series().diff().dropna()
+    return 4.0 if diffs.median() <= pd.Timedelta(minutes=15) else 1.0
+
+# Recalcul propre du % (on ne peut pas appeler _factor avant de le définir)
+rows = []
+for nom in pays_dispo:
+    sr = df_raw[nom].dropna()
+    if len(sr) == 0:
+        continue
+    h_neg     = heures_negatives(sr)
+    total_h   = len(sr) / _factor(sr)
+    pct       = h_neg / total_h * 100 if total_h > 0 else 0.0
+    rows.append({
+        "Pays":            nom,
         "Moyenne (€/MWh)": round(float(sr.mean()), 1),
         "Médiane":         round(float(sr.median()), 1),
         "Min":             round(float(sr.min()), 1),
         "Max":             round(float(sr.max()), 1),
-        "Heures ≤ 0":     int((sr <= 0).sum()),
-        "% heures ≤ 0":   f"{(sr <= 0).mean()*100:.1f} %",
+        "Heures ≤ 0":      round(h_neg, 1),
+        "% heures ≤ 0":    f"{pct:.1f} %",
     })
 
 if rows:
@@ -426,18 +438,18 @@ if rows:
         use_container_width=True,
     )
 
-    total_neg = sum(int((df_raw[n] <= 0).sum()) for n in pays_dispo)
-    if total_neg > 0:
+    total_neg_h = sum(heures_negatives(df_raw[n].dropna()) for n in pays_dispo)
+    if total_neg_h > 0:
         detail = " · ".join(
-            f"{n} : {int((df_raw[n] <= 0).sum())}h"
-            for n in pays_dispo if (df_raw[n] <= 0).any()
+            f"{n} : {round(heures_negatives(df_raw[n].dropna()), 1)}h"
+            for n in pays_dispo
+            if (df_raw[n] <= 0).any()
         )
-        st.info(f"⚠️ **{total_neg} heures à prix nul ou négatif** — {detail}")
+        st.info(f"⚠️ **{round(total_neg_h, 1)} heures à prix nul ou négatif** — {detail}")
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  EXPORT EXCEL (mis en cache : régénéré seulement si les données changent)
+# EXPORT EXCEL (mis en cache : régénéré seulement si les données changent)
 # ══════════════════════════════════════════════════════════════════════════════
-
 def _df_to_excel_bytes(df: pd.DataFrame) -> bytes:
     """DataFrame → .xlsx : index en texte heure de Paris, tz/inf nettoyés."""
     out = df.copy()
@@ -453,32 +465,27 @@ def _df_to_excel_bytes(df: pd.DataFrame) -> bytes:
     out.to_excel(buf, engine="openpyxl")
     return buf.getvalue()
 
-
 @st.cache_data(show_spinner="Génération Excel…")
 def build_excel_full(db: pd.DataFrame) -> bytes:
     """Excel de toute la base (mis en cache tant que la base ne change pas)."""
     return _df_to_excel_bytes(db)
-
 
 @st.cache_data(show_spinner="Génération Excel…")
 def build_excel_period(df_view: pd.DataFrame) -> bytes:
     """Excel de la période/sélection affichée (mis en cache par combinaison)."""
     return _df_to_excel_bytes(df_view)
 
-
-# ── Télécharger la base complète ──────────────────────────────────────────────
+# ── Télécharger la base complète ───────────────────────────────────────────────
 st.markdown("### 💾 Télécharger les données")
-
 if not db.empty:
     info_base = (
         f"{db.shape[1]} pays · {db.shape[0]:,} lignes · "
         f"{db.index.min().strftime('%d/%m/%Y')} → {db.index.max().strftime('%d/%m/%Y')}"
     )
     st.caption(f"Base disponible : {info_base}")
-
     col1, col2 = st.columns(2)
 
-    # ── Parquet (rapide) ───────────────────────────────────────────────────
+    # ── Parquet (rapide) ───────────────────────────────────────────────────────
     with col1:
         buf_pq = io.BytesIO()
         db.to_parquet(buf_pq)
@@ -493,7 +500,7 @@ if not db.empty:
         )
         st.caption("⚡ Rapide · Petit fichier · Pour Python")
 
-    # ── Excel complet (toute la période, tous pays) ───────────────────────
+    # ── Excel complet (toute la période, tous pays) ────────────────────────────
     with col2:
         st.download_button(
             label="⬇️ Télécharger en Excel — toute la période",
@@ -505,7 +512,7 @@ if not db.empty:
         )
         st.caption("📊 Format Excel · Tous pays · Toutes les dates")
 
-    # ── Excel sur la période affichée uniquement ───────────────────────────
+    # ── Excel sur la période affichée uniquement ───────────────────────────────
     st.markdown("---")
     col3, col4 = st.columns(2)
     with col3:
